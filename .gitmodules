@@ -1,0 +1,9 @@
+[submodule "third-party/cutlass"]
+	path = third-party/cutlass
+	url = https://github.com/NVIDIA/cutlass.git
+[submodule "third-party/DeepGEMM"]
+	path = third-party/DeepGEMM
+	url = https://github.com/deepseek-ai/DeepGEMM.git
+[submodule "third-party/quack"]
+	path = third-party/quack
+	url = https://github.com/Dao-AILab/quack.git
