@@ -1,17 +1,17 @@
-# TeraMOE
+# TeraMoE
 
 > [!WARNING]
-> This repository contains an experimental version of TeraMOE. The code is still under active development, and APIs, performance characteristics, and implementation details may change.
+> This repository contains an experimental version of TeraMoE. The code is still under active development, and APIs, performance characteristics, and implementation details may change.
 
-TeraMOE is a cross-node expert-parallel MoE training library that uses a cooperative persistent kernel to overlap dispatch, expert compute, and combine.
+TeraMoE is a cross-node expert-parallel MoE training library that uses a cooperative persistent kernel to overlap dispatch, expert compute, and combine.
 
 ## Performance
 
-![TeraMOE Performance](figures/teramoe_3x3.png)
+![TeraMoE Performance](figures/teramoe_3x3.png)
 
 ### Activation Memory
 
-| num_tokens | EP | Megatron activation memory (MB) | TeraMOE activation memory (MB) | Reduction |
+| num_tokens | EP | Megatron activation memory (MB) | TeraMoE activation memory (MB) | Reduction |
 |:----------:|:--:|:-------------------------------:|:------------------------------:|:---------:|
 | 8192 | 32 | 1126.25 | 810.55 | 28.03% |
 | 16384 | 32 | 2252.48 | 1603.06 | 28.84% |
@@ -23,17 +23,17 @@ TeraMOE is a cross-node expert-parallel MoE training library that uses a coopera
 ## Highlights
 > [!IMPORTANT]
 > 
-> - TeraMOE delivers up to **1.30x speedup** in communication-bound, compute-sparse regimes, matching the direction MoE architectures are evolving toward with layer-wise heterogeneous compute cost and increasingly sparse expert designs.
-> - Speedup holds under expert load imbalance: at **a peak-to-mean ratio of 3.0**, TeraMOE still delivers up to **1.24x speedup**.
+> - TeraMoE delivers up to **1.30x speedup** in communication-bound, compute-sparse regimes, matching the direction MoE architectures are evolving toward with layer-wise heterogeneous compute cost and increasingly sparse expert designs.
+> - Speedup holds under expert load imbalance: at **a peak-to-mean ratio of 3.0**, TeraMoE still delivers up to **1.24x speedup**.
 > - Activation memory is **reduced by 27.79%-28.84%** across EP sizes and token counts, noticeably relieving end-to-end memory pressure.
 
 ## Architecture
 
-TeraMOE uses one persistent kernel to coordinate five types of workers.
+TeraMoE uses one persistent kernel to coordinate five types of workers.
 
 ### SM Role Layout
 
-![TeraMOE SM role timeline](figures/SM_role_v2.png)
+![TeraMoE SM role timeline](figures/SM_role_v2.png)
 
 - **Dispatch**: routes tokens to remote experts, writes received expert inputs, and publishes token-ready signals for downstream compute.
 - **Scheduler**: observes per-expert token readiness, forms compute batches, and flushes the remaining tail work after dispatch completes.
@@ -43,7 +43,7 @@ TeraMOE uses one persistent kernel to coordinate five types of workers.
 
 ### Execution Flow
 
-![TeraMOE signal passing](figures/signal_pass.png)
+![TeraMoE signal passing](figures/signal_pass.png)
 
 The workers communicate through lightweight readiness signals. Dispatch publishes `token ready` signals, the scheduler groups ready tokens into compute batches, and compute publishes results to combine. When a token has multiple local expert hits (`nhit > 1`), gather reduces those partial results before combine consumes them.
 
@@ -67,7 +67,7 @@ The workers communicate through lightweight readiness signals. Dispatch publishe
 
 ### Install NVSHMEM
 
-TeraMOE depends on NVSHMEM. See the [NVSHMEM Installation Guide](third-party/README.md).
+TeraMoE depends on NVSHMEM. See the [NVSHMEM Installation Guide](third-party/README.md).
 
 ### Install
 
@@ -114,7 +114,7 @@ buffer.destroy()
 
 ## Acknowledgement
 
-TeraMOE is developed based on [DeepEP](https://github.com/deepseek-ai/DeepEP) and [DeepGEMM](https://github.com/deepseek-ai/DeepGEMM), and is inspired by [UniEP](https://arxiv.org/abs/2604.19241) and [SonicMOE](https://github.com/Dao-AILab/sonic-moe). We sincerely thank the authors and contributors of these projects for their work.
+TeraMoE is developed based on [DeepEP](https://github.com/deepseek-ai/DeepEP) and [DeepGEMM](https://github.com/deepseek-ai/DeepGEMM), and is inspired by [UniEP](https://arxiv.org/abs/2604.19241) and [SonicMoE](https://github.com/Dao-AILab/sonic-moe). We sincerely thank the authors and contributors of these projects for their work.
 
 ## License
 
