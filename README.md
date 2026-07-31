@@ -7,7 +7,11 @@ TeraMoE is a cross-node expert-parallel MoE training library that uses a coopera
 
 ## Performance
 
+### Latency
+
 ![TeraMoE Performance](figures/teramoe_3x3.png)
+
+Full per-configuration latency numbers are available in [`docs/latency.md`](docs/latency.md).
 
 ### Activation Memory
 
@@ -19,6 +23,8 @@ TeraMoE is a cross-node expert-parallel MoE training library that uses a coopera
 | 8192 | 64 | 1122.52 | 810.59 | 27.79% |
 | 16384 | 64 | 2249.35 | 1601.98 | 28.78% |
 | 32768 | 64 | 4491.68 | 3207.10 | 28.6% |
+
+Performance results are measured with [`tests/test_teramoe_performance.py`](tests/test_teramoe_performance.py).
 
 ## Highlights
 > [!IMPORTANT]
