@@ -28,17 +28,6 @@ using namespace ::deep_ep;
 using ComputeDType = ::deep_ep::megakernel::ComputeDType;
 namespace umma = ::deep_ep::megakernel::umma;
 
-// ============================================================================
-// Configuration
-// ============================================================================
-
-// COMPUTE_BATCH_SIZE: device code reads state->compute_batch_size at runtime.
-// Host-side allocation uses the passed-in compute_batch_size parameter.
-// The old compile-time constant is removed; use state->compute_batch_size everywhere in device code,
-// and the local `compute_batch_size` variable in host allocation functions.
-// COMPUTE_BATCH_SIZE macro kept as an alias to state->compute_batch_size for device code
-// that is called with a TeraMoEState* named `state` in scope.
-// Host-side code must #undef and use a local variable instead.
 #define COMPUTE_BATCH_SIZE (state->compute_batch_size)
 constexpr int COMPUTE_GROUP_SIZE = teramoe_config::kComputeGroupSize;
 constexpr int COMPUTE_SCHEDULER_SMS = teramoe_config::kComputeSchedulerSms;
@@ -74,7 +63,6 @@ enum TimeoutLogSite {
 // compile-time kNumRDMARanks specialization.
 constexpr int kNumCombineForwarderWarps = 24;
 constexpr int kNumCombineTMABytesPerSenderWarp = 16384;
-// Per forwarder warp: 2 stages * (sizeof(int4)*32 * (NUM_MAX_NVL_PEERS+1) + 16)
 constexpr int kNumCombineTMABytesPerForwarderWarp = 9248;
 
 template <int kNumRDMARanks>
@@ -102,10 +90,6 @@ struct ComputeTask {
     int num_tokens;
     int is_flush;
 };
-
-// ============================================================================
-// MegaKernel State (device-side, passed as kernel arg)
-// ============================================================================
 
 struct MegaKernelBackwardState;
 
@@ -180,11 +164,6 @@ struct TeraMoEState {
     int* expert_slot_base;            // [num_local_experts] base offset into per-expert-slot buffers
     int* expert_count;                // [num_local_experts] received token count per local expert
     int* recv_token_source_info;      // [max_total_recv_tokens, 2] — (recv_token_idx, topk_slot)
-    // Per-group compute task metadata, moved OUT of shared memory into GMEM so the
-    // GEMM scratch can use the full smem budget (deeper pipeline). Contiguous per row,
-    // indexed [group_id * COMPUTE_BATCH_SIZE + row]; read directly by the gate/up
-    // epilogue (route_w) and the output/bwd/signal phases. Mirrors the microkernel's
-    // contiguous GMEM metadata arrays (validated: ~0% slowdown vs smem).
     float* g_meta_route_w;            // [num_compute_groups * COMPUTE_BATCH_SIZE]
     int* g_meta_recv_idx;             // [num_compute_groups * COMPUTE_BATCH_SIZE] recv_token per row
     int* g_meta_topk_slot;            // [num_compute_groups * COMPUTE_BATCH_SIZE] compact fwd slot per row
@@ -193,20 +172,10 @@ struct TeraMoEState {
     // --- Compute signaling / per-slot output path (MEGAKERNEL_COMPUTE_DESIGN section III) ---
     int* token_compute_expected;        // [max_total_recv_tokens] how many local experts must compute this token
     __nv_bfloat16* compute_output_slot; // [num_local_experts * max_tokens_per_expert, hidden] per-slot output
-    // --- Backward activation save (forward writes; backward reads) ---
-    // fc1 input (permuted token X) saved by RECV_TOKEN index (compact, prefix-driven,
-    // deterministic across a dispatch re-run) rather than by expert slot (which is
-    // assigned via a non-deterministic atomicAdd). The backward megakernel re-runs
-    // dispatch with x=grad_output, so combine_input[recv_token] becomes grad_down;
-    // the original X is recovered here by the same recv_token index. A token that hits
-    // multiple local experts writes the same X (idempotent).
     __nv_bfloat16* bwd_fc1_input;       // [max_total_recv_tokens, hidden] fc1 input (permuted X) by recv_token
     __nv_bfloat16* bwd_preact;          // [max_total_recv_tokens, num_topk, 2 * intermediate] saved gate/up by recv_token/topk_slot
     bool owns_bwd_fc1_input;
     bool owns_bwd_preact;
-    // bwd_preact is keyed by the compact forward slot. fwd_slot_map translates the
-    // cross-pass-stable (recv_token, topk_slot) key because slot ids can differ between
-    // the forward and backward dispatch runs.
     int* fwd_slot_map;                  // [max_total_recv_tokens * num_topk] (recv_token,topk_slot) -> forward slot, -1 if none
     bool owns_fwd_slot_map;
     int* token_nhits;                   // [max_total_recv_tokens] #local-expert hits for this recv token
@@ -224,12 +193,6 @@ struct TeraMoEState {
     int* scheduler_done_count;          // final-flush arrival barrier, then scheduler completion count
     int* priority_scheduler_done;       // 0=running/barrier closed, 1=priority stopped, 2=final-flush barrier released
     int* expert_enqueue_cursor;         // [num_local_experts] how many slots have been enqueued
-    // --- Arrival-order FIFO batch queue (dispatch receiver -> scheduler) ---
-    // The receiver appends a batch id (expert*max_batches_per_expert + batch) here the
-    // moment that batch fills (COMPUTE_BATCH_SIZE slots assigned) or reaches the expert
-    // tail. Queue order == token arrival order == combine send order (approx). The
-    // scheduler drains it strictly in order, gating each batch on slot readiness. This
-    // replaces the combine-key scan + k-way merge with a single FIFO.
     int* ready_batch_queue;             // [num_local_experts * max_batches_per_expert] appended batch id; -1 = not yet published
     int* ready_batch_reserve_tail;      // atomic append cursor (receiver)
     int* expert_batch_ready_count;      // [num_local_experts * max_batches_per_expert] per-batch slot-ready counter (publisher atomicAdd)
@@ -256,17 +219,10 @@ struct TeraMoEState {
 
     ComputeDType compute_dtype;
 
-    // --- S4.4 (route B2): UMMA compute TMA atoms (device-resident) ---
-    // Per-expert 2D multicast TMA atoms for W_gateup, and per-group A(input_buf)
-    // TMA atoms. Built on host (setup_compute_tma), copied to device. nullptr
-    // when UMMA compute is disabled (falls back to WMMA path).
     umma::ComputeTmaAtoms* compute_tma;      // device ptr; wgateup[e]
     umma::ComputeDownTmaAtoms* compute_down_tma;  // device ptr; wdown[e]
     umma::InputTmaAtom_t* group_input_tma;   // device array [num_compute_groups]
     int num_compute_groups;                  // for indexing group_input_tma / barriers
-    // Global TMA A-descriptor over recv_tokens[total_expert_slots + COMPUTE_BATCH_SIZE, hidden].
-    // Feeds the gate/up GEMM directly from recv_tokens (A row base = expert_slot_base+start_slot passed as m_base),
-    // skipping the input_buf gather.
     CUtensorMap recv_tokens_a_tma;
 
     // --- Compute output buffer ---
@@ -339,17 +295,12 @@ struct TeraMoEState {
     int num_dispatch_channels;        // = num_dispatch_sms / 2 (physical even/odd SM pairing)
 
     // --- RDMA buffer reuse (dispatch <-> combine) ---
-    // Symmetric mailboxes indexed by rdma_rank (size num_rdma_ranks). Peers publish per-phase
-    // "done" via IBGDA into the local copy; the combine prelude polls the local copy.
     int* rdma_reuse_dispatch_quiet_done;  // borrowed (Buffer-owned symmetric memory)
     int* rdma_reuse_combine_clear_done;   // borrowed (Buffer-owned symmetric memory)
     int* rdma_reuse_prelude_done;         // state-owned [1] gate: leader sets, others wait
     int rdma_reuse_prelude_enable;        // 1 = run combine RDMA-reuse prelude (forward only)
 
     // --- Publish offload (dispatch->compute bridge) ---
-    // receiver copies token data + stashes topk/meta into pending_* (indexed by
-    // recv_token_idx, overwrite-safe), then pushes recv_token_idx into its SPSC ring.
-    // publisher warp consumes, does the slot alloc / metadata writes / ready publish.
     int* pending_topk_idx;            // [max_total_recv_tokens * num_topk] receiver-stashed expert ids
     float* pending_topk_weights;      // [max_total_recv_tokens * num_topk] receiver-stashed routing weights
     internode::SourceMeta* pending_meta; // [max_total_recv_tokens] receiver-stashed SourceMeta
@@ -427,9 +378,6 @@ __device__ __forceinline__ int publish_recv_token_from_pending(
 
         if (is_local_hit) {
             int local_expert_id = expert_id - local_expert_begin;
-            // Slot was already allocated by the NVL receiver (inline staging).
-            // Read it back instead of doing our own atomicAdd, so expert_token_offsets
-            // is advanced exactly once (by the receiver).
             hit_abs_slot = ld_nc_global(&state->pending_slot[recv_token_idx * num_topk + lane_id]);
             hit_slot = hit_abs_slot - state->expert_slot_base[local_expert_id];
         }
@@ -442,16 +390,9 @@ __device__ __forceinline__ int publish_recv_token_from_pending(
             state->token_slot_list[recv_token_idx * num_topk + hit_base + hit_rank] = hit_abs_slot;
         }
 
-        // Use system-scope fence to ensure recv_tokens data written by the
-        // receiver warp (same CTA) is visible to TMA loads on compute SMs.
-        // Device-scope __threadfence() is insufficient because TMA engines may
-        // bypass L1 and observe stale L2 data when the memory subsystem is under
-        // pressure (e.g., concurrent GEMMs on other SMs).
         if (is_local_hit) {
             int local_expert_id = expert_id - local_expert_begin;
             st_na_release(&state->expert_slot_ready[state->expert_slot_base[local_expert_id] + hit_slot], 1);
-            // Per-batch ready counter: when all slots in a batch have been published,
-            // the last writer triggers the FIFO append so scheduler can consume immediately.
             int batch_id = hit_slot / COMPUTE_BATCH_SIZE;
             int batch_start = batch_id * COMPUTE_BATCH_SIZE;
             int ecnt = state->expert_count[local_expert_id];
@@ -594,10 +535,6 @@ __device__ void dispatch_worker(
     const auto thread_id = static_cast<int>(threadIdx.x), warp_id = thread_id / 32, lane_id = get_lane_id();
     extern __shared__ __align__(1024) uint8_t smem_buffer[];
     const auto num_channels = state->num_dispatch_channels, channel_id = sm_id / 2;
-    // Logical channels per physical CTA pair = kStage. Must match host num_logical_channels =
-    // num_physical_channels * stage and the combine worker's num_logical_channels_per_physical,
-    // so the dispatch receiver writes and the combine sender reads the gbl-channel arrays with
-    // the same (logical) stride. Restores logical!=physical support.
     constexpr int num_logical_channels_per_physical = kStage;
     const int num_logical_channels = num_channels * num_logical_channels_per_physical;
     const bool is_forwarder = dispatch_sm_idx % 2 == 0;
@@ -618,7 +555,6 @@ __device__ void dispatch_worker(
     const bool dispatch_thread_active = warp_id < kDispatchWorkerWarps;
     if (dispatch_thread_active) {
 
-    // Warp role assignment (same as DeepEP internode.cu L494-508)
     enum class WarpRole { kRDMASender, kRDMASenderCoordinator, kRDMAAndNVLForwarder, kForwarderCoordinator, kNVLReceivers };
     const auto role_meta = [=]() -> std::pair<WarpRole, int> {
         if (is_forwarder) {
@@ -784,9 +720,6 @@ __device__ void dispatch_worker(
             auto dst_ptr =
                 dst_rdma_rank == rdma_rank ? rdma_channel_meta.recv_buffer(dst_rdma_rank) : rdma_channel_meta.send_buffer(dst_rdma_rank);
             if (lane_id < NUM_MAX_NVL_PEERS) {
-                // Prefix values keep DeepEP's cumulative token namespace for recv indexing.
-                // Head arrays are channel-private, so this cumulative prefix is no longer used
-                // as a shared head storage namespace.
                 int prefix_idx = (dst_rdma_rank * NUM_MAX_NVL_PEERS + lane_id) * num_logical_channels + logical_channel_id;
                 int prefix_start = logical_channel_id == 0 ? 0 : gbl_channel_prefix_matrix[prefix_idx - 1];
                 dst_ptr[lane_id] = -prefix_start - 1;
@@ -937,8 +870,6 @@ __device__ void dispatch_worker(
     } else if (warp_role == WarpRole::kRDMASenderCoordinator) {
         EP_DEVICE_ASSERT(num_max_rdma_chunked_recv_tokens % num_max_rdma_chunked_send_tokens == 0);
 
-        // Each logical channel owns an independent RDMA queue, so reset CTA-local
-        // sender state before issuing this channel's chunks.
         EP_STATIC_ASSERT(kNumRDMARanks <= 32, "Invalid number of RDMA ranks");
         (lane_id < kNumRDMARanks) ? (rdma_send_channel_lock[lane_id] = 0) : 0;
         (lane_id < kNumRDMARanks) ? (rdma_send_channel_tail[lane_id] = 0) : 0;
@@ -1023,9 +954,6 @@ __device__ void dispatch_worker(
                 if (meta_0 < 0 and meta_1 < 0 and meta_2 < 0 and meta_3 < 0) {
                     int start_sum = -meta_0 - 1, end_sum = -meta_1 - 1;
                     EP_DEVICE_ASSERT(start_sum >= 0 and end_sum >= 0 and end_sum >= start_sum);
-                    // The receiver treats end as the publication flag for the prefix pair.
-                    // Publish start first, then release end at system scope so a matching
-                    // acquire observes both values without relying on a later unrelated fence.
                     st_relaxed_sys_global(nvl_channel_prefix_start.buffer() + lane_id, -start_sum - 1);
                     st_release_sys_global(nvl_channel_prefix_end.buffer() + lane_id, -end_sum - 1);
 
@@ -1033,10 +961,7 @@ __device__ void dispatch_worker(
                     auto src_rdma_channel_prefix_1 = -meta_3 - 1;
                     num_tokens_to_recv_from_rdma = src_rdma_channel_prefix_1 - src_rdma_channel_prefix;
                     recv_rdma_channel_prefix_matrix[lane_id * num_logical_channels + logical_channel_id] = src_rdma_channel_prefix_1;
-                    // Save per-logical-channel token count (non-cumulative) for diagnostics and bounds checks.
                     state->recv_rdma_channel_token_count[lane_id * num_logical_channels + logical_channel_id] = num_tokens_to_recv_from_rdma;
-                    // Match original DeepEP's combine-head namespace inside this logical channel:
-                    // rank prefix + cumulative channel prefix, with the outer allocation already sliced by logical_channel_id.
                     src_rdma_channel_prefix += lane_id == 0 ? 0 : recv_rdma_rank_prefix_sum[lane_id - 1];
                     EP_DEVICE_ASSERT(num_tokens_to_recv_from_rdma >= 0);
                     break;
@@ -1295,21 +1220,13 @@ __device__ void dispatch_worker(
                 __syncwarp();
                 mbarrier_wait(tma_mbarrier, tma_phase);
 
-                // === MK-v7: Write directly to combine input namespace (no expert-local layout) ===
                 auto topk_data_ptr = reinterpret_cast<int*>(shifted + hidden_bytes + scale_bytes + sizeof(SourceMeta));
                 auto weight_data_ptr = reinterpret_cast<float*>(topk_data_ptr + num_topk);
                 auto* src_data = reinterpret_cast<const __nv_bfloat16*>(tma_buffer);
 
-                // Token data placement under direct staging: allocate the expert slot
-                // inline and stage the token into per-expert-contiguous recv_tokens[slot],
-                // stashing the slot in pending_slot for the publisher. combine_input is
-                // still used as the OUTPUT namespace later in the pipeline.
                 const int hidden_int4 = state->hidden_dim * sizeof(__nv_bfloat16) / sizeof(int4);
                 const int4* src_i4 = reinterpret_cast<const int4*>(src_data);
 
-                // --- Inline expert-slot allocation (mirrors publish_recv_token_from_pending) ---
-                // Each lane owns one topk slot; group same-expert hits so the leader
-                // lane does a single grouped atomicAdd on expert_token_offsets.
                 {
                     const int rds_local_expert_end = local_expert_begin + state->num_local_experts;
                     int rds_expert_id = -1;
@@ -1338,15 +1255,8 @@ __device__ void dispatch_worker(
                         rds_gbase = __shfl_sync(rds_same, rds_gbase, rds_leader);
                         int rds_slot = rds_gbase + rds_rank_in_e;
                         rds_abs_slot = state->expert_slot_base[rds_local_expert] + rds_slot;
-                        // Stash slot for the publisher (which will skip its own atomicAdd).
                         state->pending_slot[recv_token_idx * num_topk + lane_id] = rds_abs_slot;
-                        // NOTE: ready_batch_queue append has been moved to the publisher
-                        // (publish_recv_token_from_pending), which appends only after all
-                        // slots in a batch have expert_slot_ready set. This ensures FIFO
-                        // entries are data-ready when consumed by the scheduler.
                     }
-                    // Stage token data into each hit's contiguous slot. All 32 lanes
-                    // cooperate per hit; broadcast the hit lane's abs_slot to everyone.
                     int4* recv_tokens_i4 = reinterpret_cast<int4*>(state->recv_tokens);
                     unsigned rds_m = rds_hit_mask;
                     while (rds_m) {
@@ -1359,10 +1269,6 @@ __device__ void dispatch_worker(
                     }
                 }
 
-
-                // Fill topk weights/src_meta, publish this token's local expert count, then
-                // publish expert slots. expected must be final before any expert_recv_count
-                // advances, otherwise compute can mark multi-local-expert tokens ready early.
                 for (int topk_slot = lane_id; topk_slot < num_topk; topk_slot += 32) {
                     state->pending_topk_idx[recv_token_idx * num_topk + topk_slot] = ld_nc_global(topk_data_ptr + topk_slot);
                     state->pending_topk_weights[recv_token_idx * num_topk + topk_slot] = ld_nc_global(weight_data_ptr + topk_slot);
@@ -1394,10 +1300,6 @@ __device__ void dispatch_worker(
                 st_relaxed_sys_global(nvl_channel_head.buffer(), cached_channel_head_idx);
         }
 
-
-        // Signal dispatch done after all NVL receiver warps on this rank have finished.
-        // This is the correct location: NVL Receiver writes gbl_channel_prefix_matrix and
-        // gbl_channel_token_count (L929-934), so it must be the one to signal channel_dispatch_done.
         __syncwarp();
         if (lane_id == 0) {
             if (producer_batch_count > 0) {
@@ -1405,9 +1307,6 @@ __device__ void dispatch_worker(
                 producer_batch_count = 0;
             }
             __threadfence();
-            // A publisher warp is paired with a physical receiver warp and drains all logical stages
-            // for that receiver. Signal done only after the final logical stage; otherwise stage > 1
-            // can make the publisher exit before later logical channels enqueue their tokens.
             if (logical_stage == num_logical_channels_per_physical - 1)
                 st_na_release(&state->recv_warp_done[pub_warp_idx], 1);
             __threadfence_system();  // Ensure prefix/count writes visible before signaling
@@ -1458,10 +1357,6 @@ __device__ void dispatch_worker(
 
     }
 
-
-    // Extra dispatch CTA warps can reach this point while the active dispatch warps
-    // are still using named barriers 0/1/2. Use a separate barrier id for the
-    // whole-CTA handoff into compute so the two protocols never share a live barrier.
     asm volatile("barrier.sync 15, %0;" :: "r"(num_threads));
 
 
@@ -1472,11 +1367,6 @@ __device__ void dispatch_worker(
         reused_compute_sm_idx, total_compute_sms_after_dispatch, state, smem_buffer);
     return;
 }
-
-
-// ============================================================================
-// Compute Scheduler + Worker: scheduler enqueues expert batches, compute groups run GEMM+SwiGLU
-// ============================================================================
 
 __device__ __forceinline__ bool timeout_log_once(TeraMoEState* state, int site_id) {
     if (site_id < 0 || site_id >= kTimeoutLogCount)
@@ -1539,7 +1429,6 @@ __device__ __forceinline__ void scheduler_publish_task(TeraMoEState* state, int 
     st_na_release(state->compute_task_tail, tail + 1);
 }
 
-// source: 1=normal scheduler, 2=priority scheduler, 3=tail flush.
 __device__ __forceinline__ bool scheduler_try_enqueue_batch(
     TeraMoEState* state, int expert_id, int batch_id, int start_slot, int num_tokens, int is_flush, int source) {
     if (batch_id < 0 || batch_id >= state->max_batches_per_expert) {
@@ -1566,12 +1455,6 @@ __device__ __forceinline__ void scheduler_scan_gather_tokens(TeraMoEState* state
 
     const int total_tokens = state->combine_num_tokens;
 
-    // Each gather-scheduler thread independently scans a strided slice of tokens.
-    // No warp collectives and no shared-memory batching, so there is no divergence
-    // hazard: a ready multi-hit token is claimed exactly once via CAS and pushed as
-    // a single-token entry into the FIFO (gather_ready_queue), whose visible length
-    // is gather_ready_reserve_tail. The consumer (gather_worker) detects a not-yet
-    // written slot via the -1 sentinel.
     for (int token = gather_tid; token < total_tokens; token += gather_threads) {
         if (ld_acquire_global(&state->gather_claimed[token]) != 0)
             continue;
@@ -1591,9 +1474,6 @@ __device__ __forceinline__ void scheduler_scan_gather_tokens(TeraMoEState* state
                    state->rank, slot, state->max_total_recv_tokens);
             __threadfence_system(); trap();
         }
-        // Publish the token: make the store globally visible, then write it. The
-        // reserve counter was bumped before this store, so a consumer that sees
-        // head < reserve_tail spins on the -1 sentinel until this write lands.
         __threadfence();
         st_na_global(&state->gather_ready_queue[slot], token);
     }
@@ -1639,7 +1519,6 @@ __device__ void compute_scheduler_worker(TeraMoEState* state, int scheduler_id, 
         if (s_done)
             break;
 
-        // --- tid 0 snapshots queue bounds and advances head past already-published entries ---
         if (tid == 0) {
             int rtail = ld_acquire_global(state->ready_batch_reserve_tail);
             int head = s_head;
@@ -1651,10 +1530,6 @@ __device__ void compute_scheduler_worker(TeraMoEState* state, int scheduler_id, 
         }
         scheduler_compute_sync(num_threads);
 
-        // --- tid 0 consumes FIFO in arrival order ---
-        // Since publisher only appends to ready_batch_queue after all slots in a batch
-        // have expert_slot_ready set (via expert_batch_ready_count), any entry present
-        // in the queue is guaranteed data-ready. No slot scanning needed.
         if (tid == 0) {
             constexpr int kEnqPublished = -2;
             const int mbe = state->max_batches_per_expert;
@@ -1809,26 +1684,16 @@ __device__ __forceinline__ void compute_worker_core(
             (ComputeUmmaSmemLayout::SMEM_A_SIZE_PER_STAGE + ComputeUmmaSmemLayout::SMEM_B_SIZE_PER_STAGE) +
         kComputeUmmaBarrierBytes;
     constexpr size_t kComputeScratchBytes = kComputeUmmaScratchBytes;
-    // GEMM scratch alone must fit the launch dynamic-smem budget (metadata no longer
-    // shares it — see below). This is what lets kNumStages grow.
     static_assert(kComputeScratchBytes <=
                   (size_t)kNumCombineTMABytesPerForwarderWarp * kNumCombineForwarderWarps,
                   "compute GEMM scratch must fit the launch dynamic-smem budget");
 
-    // Compute-task metadata now lives in GMEM (moved out of shared memory so the GEMM
-    // scratch can use the full dynamic-smem budget → deeper pipeline). The s_* names are
-    // retained; each points at this SM's contiguous per-row GMEM slice
-    // [sm_id*COMPUTE_BATCH_SIZE + row]. Per-row scalar reads are cached and hidden by
-    // the MMA mainloop (microkernel-validated ~0% slowdown vs smem).
     const int64_t kMetaBase = (int64_t)sm_id * COMPUTE_BATCH_SIZE;
     int* s_recv_token_idx = state->g_meta_recv_idx + kMetaBase;
     int* s_topk_slot = state->g_meta_topk_slot + kMetaBase;
     unsigned char* s_is_single = state->g_meta_is_single + kMetaBase;
     float* s_route_w = state->g_meta_route_w + kMetaBase;
 
-    // TMEM persistent across tasks: allocate on first UMMA use, keep alive
-    // until the compute worker exits the persistent loop. This eliminates
-    // per-task init/dealloc overhead (2x cluster_sync + barrier init each).
     bool umma_tmem_allocated = false;
 
     while (true) {
@@ -1885,34 +1750,20 @@ __device__ __forceinline__ void compute_worker_core(
         int start_slot = task.start_slot;
         int batch_size = task.num_tokens;
 
-        // MK_COMPUTE_KERNEL selects the compute implementation at compile time:
-        //   1 = 1-CTA UMMA gate/up + 1-CTA UMMA down
-        //   2 = 2-CTA UMMA gate/up + 2-CTA UMMA down
         constexpr bool kUseUmmaCompute = (MK_COMPUTE_KERNEL != 0);
         static_assert(kUseUmmaCompute, "WMMA compute path removed; MK_COMPUTE_KERNEL must be 1 (1-CTA) or 2 (2-CTA UMMA)");
         const bool use_umma_gateup_for_group = kUseUmmaCompute && group_size == COMPUTE_GROUP_SIZE;
         const bool use_umma_down_for_group = kUseUmmaCompute && group_size == COMPUTE_GROUP_SIZE;
-        // A group that reaches compute MUST be a full UMMA group.
-        // Partial groups (group_size != COMPUTE_GROUP_SIZE) have no compute path now — trap
-        // loudly instead of silently skipping the GEMM. Requires num_compute_sms AND any
-        // combine-precompute SM span to be multiples of COMPUTE_GROUP_SIZE.
         EP_DEVICE_ASSERT(use_umma_gateup_for_group && use_umma_down_for_group);
         constexpr int kUmmaClusterDim = (MK_COMPUTE_KERNEL == 2 ? 2 : 1);
         constexpr int kUmmaClustersPerGroup = COMPUTE_GROUP_SIZE / kUmmaClusterDim;
 
-        // Tail-batch M packing (1-CTA only): round the real token count up to the
-        // UMMA M-tile (128) instead of always padding to COMPUTE_BATCH_SIZE (1024).
-        // This drops scheduled M-tiles from ceil(1024/128)=8 to ceil(batch_size/128),
-        // so a 10-token tail runs 1 M-tile instead of 8. Rows [batch_size, gemm_m)
-        // are still zero-padded and masked by valid_rows/batch_size.
         constexpr int kGemmMAlign = 128;   // UMMA M-tile granularity (kDgBlockM)
         const int gemm_m = (kUmmaClusterDim == 1)
             ? min(COMPUTE_BATCH_SIZE,
                   (batch_size + kGemmMAlign - 1) / kGemmMAlign * kGemmMAlign)
             : COMPUTE_BATCH_SIZE;
 
-        // DeepGEMM mega_moe prefetches TMA descriptors before the main data movement.
-        // Gate/up and down both use the UMMA path.
         if constexpr (kUseUmmaCompute) {
             if (batch_size <= COMPUTE_BATCH_SIZE) {
                 const umma::InputTmaAtom_t& prefetch_atom = state->group_input_tma[group_id];
@@ -1940,20 +1791,10 @@ __device__ __forceinline__ void compute_worker_core(
             s_topk_slot[i] = topk_slot;
             s_is_single[i] = static_cast<unsigned char>(expected == 1);
             s_route_w[i] = ld_nc_global(&state->combine_input_topk_weights[recv_token * num_topk + topk_slot]);
-            // Record the compact forward slot and use it to index bwd_preact.
-            // fwd_slot_map[recv,topk] -> compact forward slot is the same value on every
-            // SM of the group (base_offset depends only on the task, not the SM). Only one
-            // SM needs to write it — guarding to group_sm_idx==0 removes 47/48 redundant,
-            // same-address global writes (contention). All SMs still gather their own s_*.
             if (group_sm_idx == 0 && recv_token >= 0 && topk_slot >= 0)
                 state->fwd_slot_map[recv_token * num_topk + topk_slot] = base_offset;
             s_topk_slot[i] = base_offset;
         }
-        // Zero-init padding rows [batch_size, COMPUTE_BATCH_SIZE) so the UMMA path
-        // can run over the fixed task extent: padded input_buf rows are 0, and
-        // route_w must be defined (SwiGLU on padding is 0 anyway, but avoid reading
-        // uninitialized shared memory). Output/reduce/signal all mask by batch_size,
-        // so padding rows never leave the kernel.
         for (int i = batch_size + thread_id; i < gemm_m; i += blockDim.x) {
             s_route_w[i] = 0.0f;
             s_recv_token_idx[i] = -1;
@@ -1962,48 +1803,26 @@ __device__ __forceinline__ void compute_worker_core(
         __syncthreads();
 
         const int hidden_int4 = hidden * sizeof(__nv_bfloat16) / sizeof(int4);
-        // TMA-feed: the gate/up GEMM reads this task's tokens directly from
-        // recv_tokens via TMA (recv_tokens descriptor + m_base = expert_slot_base+
-        // start_slot, set at the umma_gateup call below). No input_buf gather and no
-        // post-gather compute_group_sync are needed — recv_tokens was written and
-        // fenced by dispatch before the task was enqueued.
 
         // Expert weight slices
         const __nv_bfloat16* w_gateup = &state->W_gateup[expert_id * 2 * intermediate * hidden];
         const __nv_bfloat16* w_down = &state->W_down[expert_id * hidden * intermediate];
 
-        // Gate/up compute always consumes pairwise interleaved W_gateup rows
-        // [g0,u0,g1,u1,...]. UMMA folds adjacent gate/up columns in its epilogue.
-        // umma_accum_iter is reset to 0 at the start of each GEMM pass (gate/up
-        // and down) since barriers are re-initialized. TMEM itself persists across
-        // tasks — only allocated once and freed on worker exit.
         uint32_t umma_accum_iter = 0;
 
-        // Tail batches (batch_size < COMPUTE_BATCH_SIZE) also run the UMMA path over
-        // the fixed task extent: input_buf rows [batch_size, COMPUTE_BATCH_SIZE) are
-        // zero-padded above, so padded GEMM rows are harmless and SwiGLU/output/
-        // reduce/signal all mask by batch_size, so padding never leaves the kernel.
         if (use_umma_gateup_for_group && state->compute_tma != nullptr && batch_size <= COMPUTE_BATCH_SIZE) {
             const int cluster_in_group = group_sm_idx / kUmmaClusterDim;
             const int num_clusters = kUmmaClustersPerGroup;
             char* cluster_smem = reinterpret_cast<char*>(smem_wmma_buf);
             const umma::InputTmaAtom_t& in_atom = state->group_input_tma[group_id];
 
-            // Interleaved gate/up fusion: ONE persistent GEMM computes GU with
-            // Wgu rows [g0,u0,g1,u1,...], then the epilogue folds each adjacent
-            // gate/up pair directly from TMEM into act_buf (up_buf). This is the
-            // microkernel path moved into the megakernel for both 1-CTA and 2-CTA.
             if (!umma_tmem_allocated) {
                 umma::dg_init_barriers_tmem<umma::kDgRunMulticast>(cluster_smem);
                 umma_tmem_allocated = true;
             } else {
-                // TMEM already allocated; just re-init barriers for the new pass.
                 umma::dg_reinit_barriers<umma::kDgRunMulticast>(cluster_smem);
             }
-            umma_accum_iter = 0;  // Reset accumulator phase for fresh barriers.
-            // A operand: default per-group input_buf descriptor (m_base=0). Direct-staging
-            // feeds straight from recv_tokens with the task's row base (expert_slot_base+start_slot)
-            // so no input_buf gather is needed.
+            umma_accum_iter = 0;
             const CUtensorMap* gateup_a_desc = &state->recv_tokens_a_tma;
             uint32_t gateup_a_m_base = (uint32_t)(state->expert_slot_base[expert_id] + start_slot);
             umma::umma_gateup_interleaved_persistent(
@@ -2014,20 +1833,12 @@ __device__ __forceinline__ void compute_worker_core(
                 gemm_m, intermediate, hidden,
                 cluster_in_group, num_clusters,
                 cluster_smem, umma_accum_iter,
-                // Always save gate/up preact for backward (WMMA recompute fallback removed).
                 reinterpret_cast<cutlass::bfloat16_t*>(state->bwd_preact),
                 s_recv_token_idx, s_topk_slot,
-                /* preact num_topk = 0: s_topk_slot carries the compact forward slot (Step 3.3a) */
                 0, 2 * intermediate, batch_size, gateup_a_m_base);
             compute_group_sync(state, group_id, group_size);
         }
 
-        // GEMM 3: down-proj D = act @ W_down^T.
-        // TMEM is shared with gate/up — no separate init/dealloc. accum_iter
-        // continues from gate/up so the TMEM phase ring stays correct.
-        // Tail batches run over the fixed task extent: padded act rows hold the
-        // SwiGLU of zero-padded gate/up (== 0), so padded down output rows are 0
-        // and are masked off by the batch_size-bounded output/reduce below.
         const int slot_base = state->expert_slot_base[expert_id] + start_slot;
         if (use_umma_down_for_group &&
             state->compute_down_tma != nullptr && batch_size <= COMPUTE_BATCH_SIZE) {
@@ -2064,13 +1875,8 @@ __device__ __forceinline__ void compute_worker_core(
             compute_group_sync(state, group_id, group_size);
         }
 
-        // Backward activation save: the down output is now written directly in the
-        // UMMA epilogue, so this tail only preserves fc1 input X by recv_token.
-
         const bool save_bwd = (state->bwd_fc1_input != nullptr);
         int4* bwd_in_i4 = reinterpret_cast<int4*>(state->bwd_fc1_input);
-        // input_buf is no longer filled (gate/up TMA-fed from recv_tokens); the fc1
-        // input X for backward comes straight from recv_tokens[slot_base+row].
         const int4* bwd_x_src_i4 = reinterpret_cast<const int4*>(state->recv_tokens);
         for (int idx = group_thread_id; idx < batch_size * hidden_int4; idx += group_num_threads) {
             int row = idx / hidden_int4;
@@ -2081,26 +1887,13 @@ __device__ __forceinline__ void compute_worker_core(
                     bwd_x_src_i4[(int64_t)(slot_base + row) * hidden_int4 + v];
             }
         }
-        // Device-scope fence: the UMMA epilogue has already made the down output visible.
-        // Fence the backward-save writes before any SM publishes ready flags.
         __threadfence();
         compute_group_sync(state, group_id, group_size);
 
-        // ==== Signal: per-token ready publish ====
-        // Down epilogue already wrote per-slot rows into compute_output_slot / combine_input.
-        // The same-rank multi-expert reduce is now done by the combine sender / gather worker,
-        // which gather a token's nh slots and fp32-sum them before sending. Compute only
-        // advances token_done_count and publishes nhits==1 tokens directly; nhits>1 tokens are
-        // claimed/enqueued by gather scheduler lanes once all local expert slots are done.
         {
             for (int row = group_thread_id; row < batch_size; row += group_num_threads) {
                 const int recv_token = s_recv_token_idx[row];
                 if (s_is_single[row]) {
-                    // Single-hit token: sole contributor. The down output was already made
-                    // device-visible by the __threadfence + compute_group_sync above, so
-                    // publish ready directly — no per-row fence, and no token_done_count
-                    // bump (that counter is only consumed for multi-hit tokens by the gather
-                    // worker). Removes the global atomicAdd on the common single-hit path.
                     atomicExch(&state->combine_token_ready[recv_token], 1);
                 } else {
                     atomicAdd(&state->token_done_count[recv_token], 1);
@@ -2127,14 +1920,6 @@ __device__ __forceinline__ void compute_worker(
         sm_id, compute_sm_idx, num_compute_sms, state, 0, smem_buffer);
 }
 
-// ============================================================================
-// Combine Worker v2: Full DeepEP internode.cu combine ported as __device__
-// Polls per-expert compute_done signals, then runs the full combine protocol.
-// SM pairing: even SM = NVLSender + RDMAReceiver + Coordinator
-//             odd SM  = NVLAndRDMAForwarder + Coordinator
-// Template constants: kNumRDMARanks is selected at launch by SWITCH_RDMA_RANKS.
-// ============================================================================
-
 template <int kNumRDMARanks, int kStage>
 __device__ void combine_worker(
     int combine_sm_idx,       // 0-based index among combine SMs
@@ -2153,14 +1938,6 @@ __device__ void combine_worker(
     constexpr int kNumRDMARanks_C = kNumRDMARanks;
     const int rdma_rank = state->rank / NUM_MAX_NVL_PEERS;
 
-    // ---- Overlap design (v2: per-channel compute-combine overlap) ----
-    // Per-channel pipeline: dispatch(ch) -> normalize(ch) -> combine(ch)
-    // Sender SM (even): warp0 does head normalization after channel's dispatch is done,
-    //                   then signals channel_normalized. All warps then proceed.
-    // Forwarder SM (odd): waits channel_normalized, then uses normalized heads.
-
-
-    // --- DeepEP combine kernel logic begins (direct port from internode.cu L1741-2269) ---
     enum class WarpRole { kNVLSender, kNVLAndRDMAForwarder, kRDMAReceiver, kCoordinator };
 
     using RdmaCfg = MegaKernelRdmaConfig<kNumRDMARanks>;
@@ -2185,7 +1962,6 @@ __device__ void combine_worker(
 
     const auto nvl_rank = state->rank % NUM_MAX_NVL_PEERS;
 
-    // Role assignment (same as DeepEP combine kernel)
     auto role_meta = [=]() -> std::pair<WarpRole, int> {
         auto warp_id = thread_id / 32;
         if (not is_forwarder_sm) {
@@ -2230,18 +2006,6 @@ __device__ void combine_worker(
 
     constexpr int kCombineNumTMAStages = 2;
 
-    // ===== RDMA buffer reuse prelude (phase A + metadata clean + phase B) =====
-    // Runs once per GPU before combine begins. Leader = first warp of combine SM 0 (32 lanes
-    // cooperate); all other combine threads wait on state->rdma_reuse_prelude_done.
-    //   Phase A : wait this GPU's dispatch send side is drained, quiet dispatch QPs, cross-rank
-    //             barrier over same-nvl peers via the dispatch_quiet_done mailbox.
-    //   Clean   : zero the combine RDMA metadata (data-after head/tail region) of the reused
-    //             combine RDMA buffer, re-initializing head/tail for combine.
-    //   Phase B : cross-rank barrier over same-nvl peers via the combine_clear_done mailbox, so no
-    //             peer starts combine-RDMA sends into our buffer before our metadata is cleared.
-    // Work is spread across the leader warp's lanes. Quiet tasks are partitioned so no two lanes
-    // ever quiet the same (dst_pe, qp_id) (ibgda_poll_cq is not thread-safe); flag posts use qp 0
-    // to distinct dst_pe per lane, and lane 0 owns the local flag stores / fence.
     if (state->rdma_reuse_prelude_enable) {
         const int num_rdma_ranks_local = num_ranks / NUM_MAX_NVL_PEERS;
         if (combine_sm_idx == 0 && thread_id < 32) {
@@ -2341,10 +2105,7 @@ __device__ void combine_worker(
     int combine_coordinator_last_rdma_head = 0;
     int combine_coordinator_last_nvl_head[kNumRDMARanks_C] = {0};
     uint32_t combine_forwarder_tma_phase[kCombineNumTMAStages] = {0};
-    // --- Per-logical-channel head normalization (done by Coordinator on Sender SM) ---
 
-    // All warps on this SM wait for channel_normalized[channel_id] before proceeding
-    // except the Coordinator on the Sender SM which performs the normalization.
     if (!is_forwarder_sm && warp_role == WarpRole::kCoordinator) {
         // Step 1: Wait for this channel's dispatch to complete
         if (lane_id == 0) {
@@ -2585,16 +2346,7 @@ __device__ void combine_worker(
                 int num_tokens_in_chunk = min(num_max_nvl_chunked_send_tokens, producer_token_end_idx - static_cast<int>(token_idx));
 
                 for (int chunk_idx = 0; chunk_idx < num_tokens_in_chunk; ++chunk_idx, ++token_idx) {
-                    // combine_token_ready: nhits==1 is published by compute, nhits>1 by gather
-                    // after reduce. Every combine token is expected to have at least one local hit.
                     __syncwarp();
-                    // NOTE: DeepEP's combine NVL sender forwards every token in the
-                    // [token_start_idx, token_end_idx) range unconditionally. The range from
-                    // gbl_channel_prefix_matrix already encodes exactly which tokens belong to
-                    // (src_rdma_lane, dst_nvl). The dispatch-time meta NVL bits describe a
-                    // different (dispatch) routing and must NOT be used to filter combine sends;
-                    // doing so drops legitimately-assigned tokens and stalls the NVL queue tail,
-                    // deadlocking the destination combine forwarder.
                     int dst_slot_idx = 0;
                     if (lane_id == current_rdma_idx) {
                         dst_slot_idx = (cached_channel_tail_idx++) % num_max_nvl_chunked_recv_tokens_per_rdma;
@@ -2604,8 +2356,6 @@ __device__ void combine_worker(
 
                     auto shifted_x_buffers = nvl_channel_x.buffer() + dst_slot_idx * num_bytes_per_token;
                     tma_store_wait<0>();
-                    // Gather-ready means combine_input already contains the same-rank output:
-                    // compute writes nhits==1 tokens directly, gather_worker reduces nhits>1 tokens.
                     auto gather_wait_start = clock64();
                     int ready = 0;
                     while (true) {
@@ -2665,9 +2415,6 @@ __device__ void combine_worker(
             }
         }
     } else {
-        // ========== Forwarder SM: NVLAndRDMAForwarder + RDMAReceiver + Coordinator ==========
-        // (direct port from internode.cu L1923-2269)
-
         // RDMA symmetric layout
         auto rdma_channel_data = SymBuffer<int8_t>(
             rdma_buffer_ptr, num_max_rdma_chunked_recv_tokens * num_bytes_per_token, kNumRDMARanks_C, logical_channel_id, num_logical_channels);
@@ -3064,13 +2811,6 @@ __device__ void combine_worker(
     }
 }
 
-// ============================================================================
-// Dedicated Gather Worker
-// Pops scheduler-built gather tasks. Each task owns a compact batch of ready
-// nhits > 1 tokens in gather_ready_queue; nhits == 1 is signaled by compute.
-// ============================================================================
-
-
 template <ComputeDType kComputeDType>
 __device__ void combine_precompute_worker(
     int sm_id,
@@ -3122,9 +2862,6 @@ __device__ void gather_worker(TeraMoEState* state, int gather_sm_idx) {
             s_has_task = 0;
             s_head_base = 0;
             s_batch_count = 0;
-            // Claim a contiguous range [head, head+batch) of the single-token FIFO via CAS.
-            // batch is bounded by the visible reserve_tail, so we never advance head past
-            // produced entries; competing gather SMs get disjoint ranges.
             while (true) {
                 const int tail = ld_acquire_global(state->gather_ready_reserve_tail);
                 const int head = ld_acquire_global(state->gather_ready_head);
@@ -3238,10 +2975,6 @@ __device__ void gather_worker(TeraMoEState* state, int gather_sm_idx) {
     }
 }
 
-// ============================================================================
-// Main MegaKernel Entry Point
-// ============================================================================
-
 template <int kNumRDMARanks, int kStage, ComputeDType kComputeDType>
 __global__ void __launch_bounds__(MegaKernelRdmaConfig<kNumRDMARanks>::kMegaKernelNumThreads, 1) teramoe_fused_forward_kernel(
     TeraMoEState* state
@@ -3307,11 +3040,6 @@ __global__ void __launch_bounds__(MegaKernelRdmaConfig<kNumRDMARanks>::kMegaKern
             break;
     }
 }
-
-// ============================================================================
-// Host-Side Launch
-// ============================================================================
-
 
 template <int kNumRDMARanks, int kStage, ComputeDType kComputeDType>
 static void launch_teramoe_fused_forward_case(
@@ -3463,12 +3191,6 @@ __global__ void fused_fill_kernel(
 
 static void initialize_megakernel_launch_state(const TeraMoEState& state, cudaStream_t stream);
 
-// --- TMA descriptor cache (persistent across iterations; the cache is the SOLE owner
-// of these device buffers — no TeraMoEState ever frees them). A small bounded,
-// round-robin set of entries lets the forward key and backward key coexist so both
-// paths hit across iterations. Buffers are only freed when an entry slot is evicted,
-// which is safe because the kernel that used them has already completed (synchronous
-// launch) before the slot can be reused. ---
 namespace {
 struct TmaCacheKey {
     const void* w_gateup;
@@ -3491,14 +3213,6 @@ constexpr int kTmaCacheCap = 8;
 static thread_local TmaCacheEntry s_tma_cache[kTmaCacheCap];
 static thread_local int s_tma_cache_next = 0;
 
-// Default arena chunk granularity. A new chunk is sized max(nbytes, this), so any
-// single allocation >= this value gets its own exact-sized chunk (zero tail waste),
-// while allocations smaller than this pack together. Kept small (8 MiB) so the large
-// bf16 activation/scratch buffers (bwd_preact, bwd_fc1_input, recv_tokens,
-// compute_output_slot, combine_input, gemm_workspace, ...) are each right-sized
-// instead of rounding up to a 256 MiB chunk; only the small int side-tables pay the
-// <=8 MiB packing tail. This removes the ~256 MiB-granularity internal fragmentation
-// that inflated the forward activation retained / peak reserved.
 constexpr size_t kMegakernelArenaChunkBytes = 8ull * 1024ull * 1024ull;
 
 struct MegakernelArenaAllocator {
@@ -3995,14 +3709,6 @@ TeraMoEState* allocate_teramoe_fused_state(
     arena = &transient_arena;
     CUDA_CHECK(cudaMalloc(&gemm_workspace, workspace_bytes));
     arena = &persistent_arena;
-
-    // --- S4.4 (route B2): build UMMA compute TMA atoms on host, upload to device ---
-    // Gate/up uses A[M, hidden] x interleaved Wgu[2 * intermediate, hidden]^T,
-    // with the SwiGLU epilogue storing act[M, intermediate] directly.
-    // Down uses act[M, intermediate] x W_down[hidden, intermediate]^T.
-    //
-    // TMA descriptors only depend on weight pointers, workspace pointer, and shape.
-    // Look up a bounded, persistent cache so repeated iterations skip the H2D copies.
 
     TmaCacheKey cur_key{W_gateup, W_down, gemm_workspace,
                         num_local_experts, hidden_dim, intermediate_dim, num_compute_groups,
@@ -4821,10 +4527,6 @@ __device__ __forceinline__ void compute_backward_worker_core(
     const int num_topk = state->num_topk;
     const int hidden_int4 = hidden * sizeof(__nv_bfloat16) / sizeof(int4);
 
-    // Per-group global workspace, same layout as the forward compute worker:
-    //   input_buf[M,hidden] = grad_down (gathered)   gu_buf[M,2I] = GU scratch
-    //   up_buf[M,I]         = grad_act                down_buf[M,hidden] = grad_xperm
-    // input_buf unused (grad_act TMA-fed from recv_tokens); drop the input region.
     const int input_stride = 0;
     const int gu_stride    = COMPUTE_BATCH_SIZE * twoI;
     const int act_stride   = COMPUTE_BATCH_SIZE * intermediate;

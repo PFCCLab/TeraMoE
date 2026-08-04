@@ -1,20 +1,3 @@
-// teramoe_wrapper.cuh — S4.4 (route B2): Blackwell UMMA (tcgen05) + TMEM
-// fused gate+up+SwiGLU compute for the megakernel, with 2CTA weight multicast TMA.
-//
-// Built on the VERIFIED standalone kernel compute_ref/umma_swiglu_2cta.cu (stage 3').
-// Per-expert 2D TMA atoms (one [I,d] multicast atom per expert) avoid any 3D
-// expert-dim TMA — each atom is exactly the 2D [N,K] multicast TMA proven in
-// tutorial 04. The device kernel selects atoms by expert_id from arrays.
-//
-// Ref: MEGAKERNEL_COMPUTE_DESIGN.md I.9 (tile schedule), I.9.10 (route B2).
-// Assumes hidden == intermediate == 4096 (I.9.0).
-//
-// USAGE (in teramoe_orchestrator.cu, an nvcc TU):
-//   - TeraMoEState holds a `ComputeTmaAtoms* compute_tma;` device pointer.
-//   - Host: build_compute_tma_atoms(host_struct, W_gateup, E, I, d); upload.
-//   - Device (compute_worker stage1, per 1-CTA/2-CTA cluster): call
-//       umma_gateup_interleaved_persistent(...).
-
 #pragma once
 
 #include <cute/tensor.hpp>
@@ -36,9 +19,6 @@
 #include <deep_gemm/epilogue/sm100_store_cd.cuh>
 #include <deep_gemm/epilogue/transform.cuh>
 
-// sm100_store_swiglu_from_gate lives only in the standalone reference (it is the
-// SwiGLU-fused store epilogue). Pull it in directly so the migrated GEMM body
-// can reuse the verified store path verbatim.
 #include "teramoe_sm100_bf16_compute.cuh"
 
 #include <cuda_bf16.h>
@@ -60,22 +40,9 @@ struct DownScatterParams {
     int hidden_int4;
 };
 
-// Named barrier over exactly the 128 threads (4 warps) that run the UMMA kernel
-// inside an 800-thread megakernel block. Plain __syncthreads() would wait for all
-// 800 threads and deadlock, since only thread_id<128 enter this code path.
-//
-// IMPORTANT: barrier ids 0/1/2 are ALREADY in use by the dispatch/combine roles
-// of this megakernel (`barrier.sync 0/1/2`). Reusing id 1 (the old
-// value) aliased the combine forwarder's `barrier.sync 1`, corrupting the
-// cluster-scoped tcgen05 alloc handshake and tripping
-//   __cuda_sm10x_tcgen05_guardrail_trap_phase_invalid_during_alloc.
-// Use id 8 (unused by any role) so the 128 UMMA threads sync in isolation.
 using ElemAB  = cutlass::bfloat16_t;
 using ElemAcc = float;
 
-// DeepGEMM reference config from csrc/kernels/sm100_bf16_teramoe_dg_copy.cuh:
-// BLOCK_M=128, BLOCK_N=128, BLOCK_K=64. A compute group covers the full
-// M=256 batch by having each 2-CTA cluster iterate over multiple 128x128 tiles.
 static constexpr int kTileM = 128;
 static constexpr int kTileN = 128;
 static constexpr int kAtomK = 16;
@@ -86,20 +53,6 @@ using MmaAtom_t = SM100_MMA_F16BF16_2x1SM_SS<ElemAB, ElemAB, ElemAcc, kTileM, kT
                                              UMMA::Major::K, UMMA::Major::K>;
 using TiledMMA_t = decltype(make_tiled_mma(MmaAtom_t{}));
 using ClusterShape_t = decltype(make_shape(Int<2>{}, Int<1>{}, Int<1>{}));
-// ===========================================================================
-// DeepGEMM-verbatim port (compute_ref/umma_swiglu_ws_dg.cu + sm100_bf16_teramoe_dg_copy.cuh)
-//
-// We drop the CuTe `make_tma_atom_*` atoms in favor of raw CUtensorMap TMA
-// descriptors built exactly like umma_swiglu_ws_dg.cu's make_a_desc/make_b_desc/
-// make_cd_desc, and DeepGEMM's own deep_gemm::tma::copy + make_umma_desc::fma
-// device path. This keeps the verified single-CTA (kNumMulticast=1) numeric
-// path; the megakernel block still launches as a 2-CTA cluster but the GEMM
-// helper runs the single-CTA DeepGEMM kernel body on the leader-CTA threads.
-// ===========================================================================
-
-// DeepGEMM config. kDgRunMulticast selects the 1-CTA vs 2-CTA path; the TMA
-// descriptor smem box (LOAD_BLOCK_M/N) must match the device-side LOAD_BLOCK
-// used by the UMMA GEMM path, which divides by the multicast factor.
 static constexpr uint32_t kDgBlockM     = 128;
 #ifndef MK_DG_BLOCK_N
 #define MK_DG_BLOCK_N 128
@@ -127,18 +80,6 @@ static constexpr uint32_t kDgLoadBlockN = kDgBlockN / (kDgMcastOnA ? 1 : kDgRunM
 static constexpr uint32_t kDgStoreBlockM = (kDgBlockM < 128 ? kDgBlockM : 128);              // 128
 static constexpr uint32_t kDgStoreBlockN = kDgSwizzleCD / sizeof(cutlass::bfloat16_t);       // 64
 
-// Warp-specialization constants (mirror sm100_bf16_gemm.cuh hardcoded values).
-// kNumStages: pipeline depth (matching DeepGEMM default kNumStages_=4 before merge).
-// kNumEpilogueStages: double-buffered TMEM accumulator pipeline depth = 2.
-// kNumTMAStoreStages: TMA store pipeline depth = 2.
-// kNumNonEpilogueThreads: TMA + MMA + alloc warps = 4 warps * 32 = 128.
-// kNumEpilogueThreads: epilogue store warps = 4 warps * 32 = 128 (= STORE_BLOCK_M).
-// kNumTmemCols: get_num_aligned_tmem_cols<kNumEpilogueStages * UMMA_N>
-//   = get_num_aligned_tmem_cols<2 * 128> = get_num_aligned_tmem_cols<256> = 256.
-// Tuned config (S6/EPI2/TS1). Reachable now that per-token metadata was moved out of
-// smem into GMEM: GEMM scratch = 16384(CD,TS1) + 6*32768 + barriers ≈ 213KB < 221952
-// launch budget, so no launch-smem bump needed. Deepening the pipeline is the biggest
-// MFU lever (fwd +~23%, bwd grad_x +~34% vs the old kNumStages=4).
 #ifndef MK_DG_NUM_STAGES
 #define MK_DG_NUM_STAGES 6
 #endif
