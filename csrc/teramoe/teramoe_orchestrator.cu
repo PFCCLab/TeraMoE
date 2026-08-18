@@ -4440,6 +4440,7 @@ struct MegaKernelBackwardState {
     __nv_bfloat16* wgrad_act_slot;         // [expert_slots, intermediate], route-weighted
     __nv_bfloat16* wgrad_dz_slot;          // [expert_slots, hidden]
     __nv_bfloat16* wgrad_dgu_slot;         // [expert_slots, 2 * intermediate]
+    int* bwd_slot_desc;                    // [expert_slots] per-backward-slot stable key = recv_token * num_topk + topk_slot
 };
 
 struct MegaKernelBackwardHostContext {
@@ -4655,6 +4656,7 @@ __device__ __forceinline__ void compute_backward_worker_core(
             s_topk_slot[i] = topk_slot;
             s_is_single[i] = static_cast<unsigned char>(expected == 1);
             s_route_w[i] = ld_nc_global(&state->combine_input_topk_weights[recv_token * num_topk + topk_slot]);
+            bs->bwd_slot_desc[base_offset] = recv_token * num_topk + topk_slot;
         }
         for (int i = batch_size + thread_id; i < COMPUTE_BATCH_SIZE; i += blockDim.x) {
             s_recv_token_idx[i] = -1;
@@ -4951,6 +4953,7 @@ MegaKernelBackwardState* allocate_teramoe_fused_backward_state(
     void* wgrad_act_slot,
     void* wgrad_dz_slot,
     void* wgrad_dgu_slot,
+    void* bwd_slot_desc,
     const int* host_expert_count,
     int total_sms,
     MegaKernelBackwardHostContext** host_context,
@@ -5059,6 +5062,7 @@ MegaKernelBackwardState* allocate_teramoe_fused_backward_state(
     hs.wgrad_act_slot = reinterpret_cast<__nv_bfloat16*>(wgrad_act_slot);
     hs.wgrad_dz_slot = reinterpret_cast<__nv_bfloat16*>(wgrad_dz_slot);
     hs.wgrad_dgu_slot = reinterpret_cast<__nv_bfloat16*>(wgrad_dgu_slot);
+    hs.bwd_slot_desc = reinterpret_cast<int*>(bwd_slot_desc);
     host_ctx->wgrad_dgu_a_tma.resize(num_dgu_batch_tmas);
     for (int expert = 0; expert < fs.num_local_experts; ++expert) {
         const int ebase = h_bwd_expert_slot_base[expert];

@@ -7,7 +7,7 @@ from typing import Callable, List, Tuple, Optional, Union
 import teramoe_cpp
 # noinspection PyUnresolvedReferences
 from teramoe_cpp import Config, EventHandle
-from .utils import EventOverlap, check_nvlink_connections
+from .utils import EventOverlap, check_nvlink_connections, permute_scratch_deterministic
 
 
 class Buffer:
@@ -740,10 +740,20 @@ class Buffer:
         @torch.autograd.function.once_differentiable
         def backward(ctx, grad_output):
             (grad_x, grad_w_gateup, grad_w_down, grad_topk_weights,
-             scratch_x, scratch_act, scratch_dz, scratch_dgu, cu_seqlens_k) = (
-                ctx.runtime.teramoe_backward(
-                    ctx.handle, grad_output.contiguous(), ctx.grad_topk_weights,
-                    ctx.total_sms, ctx.stage))
+             scratch_x, scratch_act, scratch_dz, scratch_dgu, cu_seqlens_k,
+             bwd_slot_desc) = ctx.runtime.teramoe_backward(
+                ctx.handle, grad_output.contiguous(), ctx.grad_topk_weights,
+                ctx.total_sms, ctx.stage)
+
+            # For determinism, permute the scratch tensors into a canonical
+            # order keyed by each slot's stable bwd_slot_desc, so the wgrad GEMM
+            # accumulates in a fixed order.
+            if torch.utils.strtobool(os.getenv("FLAGS_cudnn_deterministic", "False")):
+                scratch_x, scratch_act, scratch_dz, scratch_dgu = (
+                    permute_scratch_deterministic(
+                        bwd_slot_desc, cu_seqlens_k,
+                        (scratch_x, scratch_act, scratch_dz, scratch_dgu)))
+
             try:
                 from quack.gemm_interface import gemm as _quack_gemm
             except Exception as exc:

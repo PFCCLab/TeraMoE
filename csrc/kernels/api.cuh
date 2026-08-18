@@ -477,6 +477,7 @@ MegaKernelBackwardState* allocate_teramoe_fused_backward_state(
     void* wgrad_act_slot,
     void* wgrad_dz_slot,
     void* wgrad_dgu_slot,
+    void* bwd_slot_desc,
     const int* host_expert_count,
     int total_sms,
     MegaKernelBackwardHostContext** host_context,

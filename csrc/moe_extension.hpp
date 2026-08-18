@@ -406,7 +406,8 @@ public:
         int combine_start_head_percent);
 
     std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
-               torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor> teramoe_backward(
+               torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+               torch::Tensor, torch::Tensor> teramoe_backward(
         const std::shared_ptr<TeraMoEAutogradContext>& context,
         const torch::Tensor& grad_output,
         const std::optional<torch::Tensor>& grad_topk_weights,

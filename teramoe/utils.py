@@ -99,3 +99,23 @@ def check_nvlink_connections(group):
 
         # Close NVML
         pynvml.nvmlShutdown()
+
+
+def permute_scratch_deterministic(bwd_slot_desc, cu_seqlens_k, tensors):
+    """Reorder wgrad scratch rows into a canonical, reproducible order.
+
+    The `bwd_slot_desc[slot]` holds each slot's unique stable key (recv_token *
+    num_topk + topk_slot). Sorting each expert segment by that key yields a
+    deterministic permutation.
+    """
+    cu = cu_seqlens_k.tolist()
+    total = cu[-1] if len(cu) > 0 else 0
+    if total <= 0:
+        return tuple(tensors)
+    perm = torch.empty(total, dtype=torch.int64, device=bwd_slot_desc.device)
+    for e in range(len(cu) - 1):
+        s, t = cu[e], cu[e + 1]
+        if t > s:
+            local = torch.argsort(bwd_slot_desc[s:t]).to(torch.int64)
+            perm[s:t] = local + s
+    return tuple(x.gather(perm) for x in tensors)

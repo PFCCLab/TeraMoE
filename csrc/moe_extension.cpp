@@ -2514,7 +2514,8 @@ std::tuple<torch::Tensor, std::shared_ptr<TeraMoEAutogradContext>> Buffer::teram
 }
 
 std::tuple<torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
-           torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor>
+           torch::Tensor, torch::Tensor, torch::Tensor, torch::Tensor,
+           torch::Tensor, torch::Tensor>
 Buffer::teramoe_backward(
     const std::shared_ptr<TeraMoEAutogradContext>& context,
     const torch::Tensor& grad_output,
@@ -2574,17 +2575,19 @@ Buffer::teramoe_backward(
     auto scratch_dz_backing = torch::empty({(int64_t)alloc_slots, hidden}, bf16_options);
     auto scratch_dgu_backing = torch::empty(
         {(int64_t)alloc_slots + compute_batch_size, two_i}, bf16_options);
+    auto bwd_slot_desc_backing = torch::empty({(int64_t)alloc_slots}, cu_options);
     auto scratch_x = scratch_x_backing.narrow(0, 0, total_slots);
     auto scratch_act = scratch_act_backing.narrow(0, 0, total_slots);
     auto scratch_dz = scratch_dz_backing.narrow(0, 0, total_slots);
     auto scratch_dgu = scratch_dgu_backing.narrow(0, 0, total_slots);
+    auto bwd_slot_desc = bwd_slot_desc_backing.narrow(0, 0, total_slots);
     ::teramoe::MegaKernelBackwardHostContext* backward_host_context = nullptr;
     auto* backward_state = ::teramoe::allocate_teramoe_fused_backward_state(
         context->state(), grad_output.data_ptr(), grad_input.data_ptr(),
         grad_w_gateup.data_ptr(), grad_w_down.data_ptr(), grad_topk_weights_out.data_ptr(),
         scratch_x_backing.data_ptr(), scratch_act_backing.data_ptr(), scratch_dz_backing.data_ptr(),
-        scratch_dgu_backing.data_ptr(), expert_token_counts.data(), total_sms,
-        &backward_host_context, stream,
+        scratch_dgu_backing.data_ptr(), bwd_slot_desc_backing.data_ptr(), expert_token_counts.data(),
+        total_sms, &backward_host_context, stream,
         &context->cached_host_state());
     ::teramoe::prepare_teramoe_backward_communication_replay(
         backward_host_context, barrier_signal_ptrs_gpu,
@@ -2614,11 +2617,12 @@ Buffer::teramoe_backward(
     ::teramoe::free_teramoe_fused_backward_state(backward_state, backward_host_context);
     ::teramoe::free_teramoe_backward_host_context(backward_host_context);
     return {grad_input, grad_w_gateup, grad_w_down, grad_topk_weights_out,
-            scratch_x, scratch_act, scratch_dz, scratch_dgu, cu_seqlens_k};
+            scratch_x, scratch_act, scratch_dz, scratch_dgu, cu_seqlens_k, bwd_slot_desc};
 #else
     EP_HOST_ASSERT(false && "megakernel backward requires NVSHMEM support");
     return {torch::Tensor(), torch::Tensor(), torch::Tensor(), torch::Tensor(),
-            torch::Tensor(), torch::Tensor(), torch::Tensor(), torch::Tensor(), torch::Tensor()};
+            torch::Tensor(), torch::Tensor(), torch::Tensor(), torch::Tensor(),
+            torch::Tensor(), torch::Tensor()};
 #endif
 }
 
