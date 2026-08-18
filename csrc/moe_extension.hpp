@@ -69,16 +69,18 @@ public:
                               int intermediate_dim,
                               int num_topk,
                               int num_local_experts,
-                              std::vector<int> expert_counts);
+                              std::vector<int> expert_counts,
+                              int num_recv_tokens);
     ~TeraMoEAutogradContext();
 
-    ::teramoe::TeraMoEState* state() const;
-    int num_tokens() const;
-    int hidden_dim() const;
-    int intermediate_dim() const;
-    int num_topk() const;
-    int num_local_experts() const;
-    const std::vector<int>& expert_counts() const;
+    ::teramoe::TeraMoEState* state() const { return state_; }
+    int num_tokens() const { return num_tokens_; }
+    int hidden_dim() const { return hidden_dim_; }
+    int intermediate_dim() const { return intermediate_dim_; }
+    int num_topk() const { return num_topk_; }
+    int num_local_experts() const { return num_local_experts_; }
+    const std::vector<int>& expert_counts() const { return expert_counts_; }
+    int num_recv_tokens() const { return num_recv_tokens_; }
 
     // Host-side snapshot of the forward TeraMoEState, captured at forward-end.
     // The backward uses this directly instead of a synchronous D2H cudaMemcpy from
@@ -103,6 +105,7 @@ private:
     int num_topk_;
     int num_local_experts_;
     std::vector<int> expert_counts_;
+    int num_recv_tokens_;
     std::vector<torch::Tensor> retained_layout_tensors_;
 };
 

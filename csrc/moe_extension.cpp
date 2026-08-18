@@ -1948,14 +1948,16 @@ TeraMoEAutogradContext::TeraMoEAutogradContext(::teramoe::TeraMoEState* state,
                                                      int intermediate_dim,
                                                      int num_topk,
                                                      int num_local_experts,
-                                                     std::vector<int> expert_counts)
+                                                     std::vector<int> expert_counts,
+                                                     int num_recv_tokens)
     : state_(state),
       num_tokens_(num_tokens),
       hidden_dim_(hidden_dim),
       intermediate_dim_(intermediate_dim),
       num_topk_(num_topk),
       num_local_experts_(num_local_experts),
-      expert_counts_(std::move(expert_counts)) {}
+      expert_counts_(std::move(expert_counts)),
+      num_recv_tokens_(num_recv_tokens) {}
 
 TeraMoEAutogradContext::~TeraMoEAutogradContext() {
 #ifndef DISABLE_NVSHMEM
@@ -1965,38 +1967,6 @@ TeraMoEAutogradContext::~TeraMoEAutogradContext() {
 #endif
     if (cached_host_state_ != nullptr)
         ::teramoe::detail::state_cache::free_host(cached_host_state_);
-}
-
-::teramoe::TeraMoEState* TeraMoEAutogradContext::state() const {
-    return state_;
-}
-
-int TeraMoEAutogradContext::num_tokens() const {
-    return num_tokens_;
-}
-
-int TeraMoEAutogradContext::hidden_dim() const {
-    return hidden_dim_;
-}
-
-int TeraMoEAutogradContext::intermediate_dim() const {
-    return intermediate_dim_;
-}
-
-int TeraMoEAutogradContext::num_topk() const {
-    return num_topk_;
-}
-
-int TeraMoEAutogradContext::num_local_experts() const {
-    return num_local_experts_;
-}
-
-const std::vector<int>& TeraMoEAutogradContext::expert_counts() const {
-    return expert_counts_;
-}
-
-void TeraMoEAutogradContext::retain_layout_tensors(std::vector<torch::Tensor> tensors) {
-    retained_layout_tensors_ = std::move(tensors);
 }
 
 const ::teramoe::TeraMoEState& TeraMoEAutogradContext::cached_host_state() const {
@@ -2009,6 +1979,10 @@ void TeraMoEAutogradContext::set_cached_host_state(const ::teramoe::TeraMoEState
         ::teramoe::detail::state_cache::free_host(cached_host_state_);
     cached_host_state_ = ::teramoe::detail::state_cache::alloc_host();
     ::teramoe::detail::state_cache::copy_host(cached_host_state_, &hs);
+}
+
+void TeraMoEAutogradContext::retain_layout_tensors(std::vector<torch::Tensor> tensors) {
+    retained_layout_tensors_ = std::move(tensors);
 }
 
 std::tuple<torch::Tensor, std::shared_ptr<TeraMoEAutogradContext>> Buffer::teramoe_fused_forward_impl(
@@ -2420,7 +2394,7 @@ std::tuple<torch::Tensor, std::shared_ptr<TeraMoEAutogradContext>> Buffer::teram
         context = std::make_shared<TeraMoEAutogradContext>(
             static_cast<::teramoe::TeraMoEState*>(state),
             num_tokens, hidden_dim, intermediate_dim, num_topk, num_local_experts,
-            mk_expert_counts);
+            mk_expert_counts, max_total_recv_tokens);
         // The backward re-runs dispatch/combine on a fresh v7 state and only reuses the
         // saved-activation buffers (bwd_fc1_input / bwd_preact / fwd_slot_map) and expert_count
         // from this forward state. Release the forward-only working buffers (recv_tokens,
@@ -2649,7 +2623,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
 
     pybind11::class_<deep_ep::TeraMoEAutogradContext,
                      std::shared_ptr<deep_ep::TeraMoEAutogradContext>>(
-        m, "TeraMoEAutogradContext", py::module_local());
+        m, "TeraMoEAutogradContext", py::module_local())
+        .def("num_recv_tokens", &deep_ep::TeraMoEAutogradContext::num_recv_tokens)
+        .def("tokens_per_expert", &deep_ep::TeraMoEAutogradContext::expert_counts);
 
     pybind11::class_<deep_ep::Buffer>(m, "Buffer", py::module_local())
         .def(pybind11::init<int, int, int64_t, int64_t, bool, bool, bool, bool, int>())
