@@ -1,121 +1,31 @@
 # TeraMoE
 
-> [!WARNING]
-> This repository contains an experimental version of TeraMoE. The code is still under active development, and APIs, performance characteristics, and implementation details may change.
+TeraMoE 是一个适用于跨节点 EP 并行的通信-计算 overlap 的 MoE 训练算子库
 
-TeraMoE is a cross-node expert-parallel MoE training library that uses a cooperative persistent kernel to overlap dispatch, expert compute, and combine.
-
-## Performance
-
-### Latency
-
-![TeraMoE Performance](figures/teramoe_3x3.png)
-
-Full per-configuration latency numbers are available in [`docs/latency.md`](docs/latency.md).
-
-### Activation Memory
-
-| num_tokens | EP | Megatron activation memory (MB) | TeraMoE activation memory (MB) | Reduction |
-|:----------:|:--:|:-------------------------------:|:------------------------------:|:---------:|
-| 8192 | 32 | 1126.25 | 810.55 | 28.03% |
-| 16384 | 32 | 2252.48 | 1603.06 | 28.84% |
-| 32768 | 32 | 4507.88 | 3201.75 | 28.83% |
-| 8192 | 64 | 1122.52 | 810.59 | 27.79% |
-| 16384 | 64 | 2249.35 | 1601.98 | 28.78% |
-| 32768 | 64 | 4491.68 | 3207.10 | 28.6% |
-
-Performance results are measured with [`tests/test_teramoe_performance.py`](tests/test_teramoe_performance.py).
-
-## Highlights
+## 亮点
 > [!IMPORTANT]
 > 
-> - TeraMoE delivers up to **1.30x speedup** in communication-bound, compute-sparse regimes, matching the direction MoE architectures are evolving toward with layer-wise heterogeneous compute cost and increasingly sparse expert designs.
-> - Speedup holds under expert load imbalance: at **a peak-to-mean ratio of 3.0**, TeraMoE still delivers up to **1.24x speedup**.
-> - Activation memory is **reduced by 27.79%-28.84%** across EP sizes and token counts, noticeably relieving end-to-end memory pressure.
+> - 适用于跨机大 EP（EP32/EP64）场景，通过计算-通信 Overlap 实现性能提升，
+> - Overlap 有更强的抗路由不均衡能力
+> - 与现行 DeepEP+DeepGEMM 方案前反向逐位对齐，收敛风险小
 
-## Architecture
-
-TeraMoE uses one persistent kernel to coordinate five types of workers.
-
-### SM Role Layout
-
-![TeraMoE SM role timeline](figures/SM_role_v2.png)
-
-- **Dispatch**: routes tokens to remote experts, writes received expert inputs, and publishes token-ready signals for downstream compute.
-- **Scheduler**: observes per-expert token readiness, forms compute batches, and flushes the remaining tail work after dispatch completes.
-- **Compute**: executes expert computation for ready token batches, including gate/up projection, activation, and down projection.
-- **Combine**: returns expert outputs to the source ranks and applies the final weighted accumulation required by MoE routing.
-- **Gather**: handles local multi-hit token reduction when multiple expert results need to be accumulated for the same token.
-
-### Execution Flow
-
-![TeraMoE signal passing](figures/signal_pass.png)
-
-The workers communicate through lightweight readiness signals. Dispatch publishes `token ready` signals, the scheduler groups ready tokens into compute batches, and compute publishes results to combine. When a token has multiple local expert hits (`nhit > 1`), gather reduces those partial results before combine consumes them.
-
-## TODO
-
-- [ ] Support PaddlePaddle
-- [ ] Add FP8 support.
-- [ ] Migrate the communication backend from NVSHMEM to NCCL.
-- [ ] Add SM90 support.
-
-## Quick start
+## 快速开始
 
 ### Requirements
 
 - SM100 GPUs
-- Python 3.12 and above
+- Python 3.10 and above
 - CUDA toolchain with SM100 support
-- PyTorch 2.1 and above
 - RDMA-capable network for cross-node communication
 - NVSHMEM installed
 
-### Install NVSHMEM
+### 安装
 
-TeraMoE depends on NVSHMEM. See the [NVSHMEM Installation Guide](third-party/README.md).
-
-### Install
+已将 DeepEP 和 DeepGEMM 的安装流程打包在一个 setup.py 里，无需手动配置各种路径，一键即可安装
 
 ```bash
-MK_COMPUTE_KERNEL=1 python -m pip install -v .
-```
-
-## Training API
-
-```python
-import torch
-import torch.distributed as dist
-import teramoe
-
-group = dist.group.WORLD
-num_sms = torch.cuda.get_device_properties(torch.cuda.current_device()).multi_processor_count
-buffer = teramoe.Buffer(
-    group,
-    int(2e9),
-    int(1e9),
-    low_latency_mode=False,
-    num_qps_per_rank=num_sms,
-    explicitly_destroy=True,
-)
-
-output = buffer.teramoe_autograd(
-    x,
-    topk_idx,
-    topk_weights,
-    W_gateup,
-    W_down,
-    num_experts,
-    num_dispatch_sms=48,
-    num_combine_sms=48,
-    total_sms=num_sms,
-    stage=1,
-    compute_batch_size=4096,
-    combine_start_head_percent=70,
-)
-output.backward(torch.randn_like(output))
-
-buffer.destroy()
+python setup.py bdist_wheel
+python -m pip install --force-reinstall --no-deps dist/teramoe-*.whl
 ```
 
 ## Acknowledgement
