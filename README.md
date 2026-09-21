@@ -24,8 +24,37 @@ TeraMoE 是一个适用于跨节点 EP 并行的通信-计算 overlap 的 MoE �
 已将 DeepEP 和 DeepGEMM 的安装流程打包在一个 setup.py 里，无需手动配置各种路径，一键即可安装
 
 ```bash
+git clone https://github.com/PFCCLab/TeraMoE.git
+cd TeraMoE
+git submodule update --init --recursive
+
 python setup.py bdist_wheel
 python -m pip install --force-reinstall --no-deps dist/teramoe-*.whl
+```
+
+## 用户接口
+
+TeraMoE 提供了与 fleet MoELayer 兼容的自动反向接口，参数传入方式基本与 fleet 对齐，API 内部已经封装好了 DeepEP 建连、Overlap 策略、显存管理等逻辑，可以以极少的代码量接入 fleet
+
+```python
+import teramoe
+
+# init
+teramoe.configure_buffer(48)
+
+# forward
+hidden_states = teramoe.forward_autograd(
+    hidden_states,
+    topk_weights,
+    topk_indices,
+    grouped_gemm_experts,
+    num_experts,
+    moe_group,
+    combine_overlap_handle,
+    chunk_size=4096,
+    num_calc_sms=100,
+    combine_overlap_ratio=0.3,
+)
 ```
 
 ## Acknowledgement
