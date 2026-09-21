@@ -1,5 +1,6 @@
 import os
 import sys
+import argparse
 
 import paddle
 import paddle.distributed as dist
@@ -30,6 +31,7 @@ from paddlefleet.transformer.transformer_config import TransformerConfig
 SEQLEN = 16384
 NUM_COMM_SMS = 48
 NUM_CALC_SMS = 100
+USE_FP8 = False
 
 
 def initialize_fleet():
@@ -81,6 +83,9 @@ class TeraMoELayer(MoELayer):
             self.num_experts,
             self.moe_group,
             combine_overlap_handle,
+            fp8=self.config.fp8,
+            fp8_wgrad=self.config.fp8_wgrad,
+            use_ue8m0=self.config.use_ue8m0,
             num_calc_sms=NUM_CALC_SMS,
         )
 
@@ -93,6 +98,9 @@ class TeraMoELayer(MoELayer):
 
 
 def run_layer(moe_layer, hidden_states, out_grad, profile=None):
+    if USE_FP8:
+        moe_layer.fp8_quant_weight(batch_mode=True)
+
     # warmup
     hidden_states = hidden_states.detach()
     hidden_states.stop_gradient = False
@@ -156,8 +164,9 @@ def main():
         num_experts_per_tok=10,
         topk_method="noaux_tc",
         moe_token_dispatcher_type="deepep",
-        # fp8="e4m3",
+        fp8="e4m3" if USE_FP8 else None,
         fp8_wgrad=False,
+        use_ue8m0=True,
         moe_topk_fusion=True,
         routing_map_fusion=True,
         sigmoid_gate_fusion=True,
@@ -208,9 +217,16 @@ def main():
     ok = True
     for name, ref, tgt in zip(names, fleet_out, teramoe_out):
         diff = (ref.float() - tgt.float()).abs()
-        max_, avg_ = float(diff.max()), float(diff.mean())
-        ok = ok and max_ == 0
-        print(f"{name}: max={max_} avg={avg_}")
+        avg, max_ = float(diff.mean()), float(diff.max())
+        if max_ == 0:
+            print(f"{name}: 0.0")
+        elif USE_FP8:
+            # wgrad 的绝对误差比较大，只能比较 cos 相似性
+            cos = F.cosine_similarity(ref.flatten(), tgt.flatten(), axis=0, eps=0)
+            print(f"{name}: avg={avg:e} max={max_:e} cos={cos:.6f}")
+            ok = ok and cos > 0.999
+        else:
+            ok = False
 
     ################################# PROFILE ##################################
 
@@ -241,4 +257,10 @@ def main():
 
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--fp8", action="store_true", help="Use fp8")
+    args = parser.parse_args()
+
+    USE_FP8 = args.fp8
+
     main()
