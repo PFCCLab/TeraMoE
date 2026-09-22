@@ -29,9 +29,10 @@ import paddlefleet.transformer.moe.fused_a2a as fleet_fused_a2a
 from paddlefleet.transformer.transformer_config import TransformerConfig
 
 SEQLEN = 16384
-NUM_COMM_SMS = 48
-NUM_CALC_SMS = 100
+NUM_COMM_SMS = 52
+NUM_CALC_SMS = 96
 USE_FP8 = False
+LONG_RUN = 0
 
 
 def initialize_fleet():
@@ -130,6 +131,10 @@ def run_layer(moe_layer, hidden_states, out_grad, profile=None):
     if profile is None:
         return out, hidden_states.grad, *weight_grads
 
+    if LONG_RUN:
+        print("LONG_RUN", profile, "-" * 80)
+        return run_layer_long(moe_layer, hidden_states)
+
     # profile
     paddle.base.core.nvprof_nvtx_push(profile)
 
@@ -152,9 +157,58 @@ def run_layer(moe_layer, hidden_states, out_grad, profile=None):
     paddle.base.core.nvprof_nvtx_pop()
 
 
+def run_layer_long(moe_layer, hidden_states):
+    """长跑模式, 每次用不同的输入, 制造一定的路由波动."""
+    events = [paddle.cuda.Event(enable_timing=True) for _ in range(3)]
+
+    for i in range(LONG_RUN):
+        hidden_states = paddle.randn_like(hidden_states)
+        hidden_states.stop_gradient = False
+        hidden_states_t = hidden_states.clone()
+        out_grad = paddle.randn_like(hidden_states)
+
+        dist.all_reduce(paddle.empty([1]))
+        events[0].record()
+
+        with paddle.amp.auto_cast(enable=True, dtype="bfloat16"):
+            out, _ = moe_layer(hidden_states_t)
+
+        # 我们把 "所有完成 rank 完成" 才视为完成, 因为在多层网络里面只有一层完成无意义
+        dist.all_reduce(paddle.empty([1]))
+        events[1].record()
+
+        out.backward(out_grad)
+
+        dist.all_reduce(paddle.empty([1]))
+        events[2].record()
+
+        paddle.device.synchronize()
+        fwd_time = events[0].elapsed_time(events[1])
+        bwd_time = events[1].elapsed_time(events[2])
+        print(end=f"{i + 1}\t{fwd_time}\t{bwd_time}\n", flush=True)
+
+
+def check(fleet_out, teramoe_out):
+    names = ["out", "hs_grad", "w1_grad", "w2_grad", "shared_w1_grad", "shared_w2_grad"]
+    ok = True
+    for name, ref, tgt in zip(names, fleet_out, teramoe_out):
+        diff = (ref.float() - tgt.float()).abs()
+        avg, max = float(diff.mean()), float(diff.max())
+        if max == 0:
+            print(f"{name}: 0.0")
+        elif USE_FP8:
+            # wgrad 的绝对误差比较大，只能比较 cos 相似性
+            cos = float(F.cosine_similarity(ref.flatten(), tgt.flatten(), axis=0, eps=0))
+            print(f"{name}: avg={avg:e} max={max:e} cos={cos:.6f}")
+            ok = ok and cos > 0.999
+        else:
+            ok = False
+    return ok
+
+
 def main():
     group = initialize_fleet()
-    fleet_fused_a2a.configure_buffer(NUM_COMM_SMS)
+    fleet_fused_a2a.configure_buffer(52)
     teramoe.configure_buffer(NUM_COMM_SMS)
 
     config = TransformerConfig(
@@ -217,20 +271,8 @@ def main():
     teramoe_fused_a2a._buffer = None
     dist.barrier()
 
-    names = ["out", "hs_grad", "w1_grad", "w2_grad", "shared_w1_grad", "shared_w2_grad"]
-    ok = True
-    for name, ref, tgt in zip(names, fleet_out, teramoe_out):
-        diff = (ref.float() - tgt.float()).abs()
-        avg, max_ = float(diff.mean()), float(diff.max())
-        if max_ == 0:
-            print(f"{name}: 0.0")
-        elif USE_FP8:
-            # wgrad 的绝对误差比较大，只能比较 cos 相似性
-            cos = F.cosine_similarity(ref.flatten(), tgt.flatten(), axis=0, eps=0)
-            print(f"{name}: avg={avg:e} max={max_:e} cos={cos:.6f}")
-            ok = ok and cos > 0.999
-        else:
-            ok = False
+    ok = check(fleet_out, teramoe_out)
+    del fleet_out, teramoe_out
 
     ################################# PROFILE ##################################
 
@@ -239,7 +281,7 @@ def main():
     # fleet
     moe_layer = MoELayer(config, MoESublayers(mlp_spec), group)
     moe_layer = paddle.amp.decorate(moe_layer, level="O2", dtype="bfloat16")
-    state_dict = moe_layer.state_dict()
+    moe_layer.set_state_dict(state_dict)
 
     run_layer(moe_layer, hidden_states, out_grad, profile="fleet")
 
@@ -257,14 +299,18 @@ def main():
     paddle.base.core.nvprof_stop()
 
     print("PASSED" if ok else "FAILED")
-    assert ok
+    ok_list = []
+    dist.all_gather_object(ok_list, ok)
+    assert all(ok_list), f"First failed rank: {ok_list.index(False)}"
 
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--fp8", action="store_true", help="Use fp8")
+    parser.add_argument("--long-run", type=int, default=0, help="Specify long-run steps")
     args = parser.parse_args()
 
     USE_FP8 = args.fp8
+    LONG_RUN = args.long_run
 
     main()

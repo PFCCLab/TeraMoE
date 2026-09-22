@@ -41,7 +41,7 @@ print(end=f"\033[1;32mrank: {rank}, nnodes: {nnodes}, master: {master}, "
       f"trainer: {pod_index}\033[0m\n", flush=True)
 
 cmd = [
-    "python", "-m", "paddle.distributed.launch",
+    "python", "-um", "paddle.distributed.launch",
     "--log_dir", log_dir,
     "--master", f"{master}:{port}",
     "--rank", str(rank), "--nnodes", str(nnodes),

@@ -504,8 +504,6 @@ class TeraMoENode:
 
         ########################### COMBINE FORWARD ############################
 
-        combine_event = deep_ep.Buffer.capture()
-
         out, _, event = self.buffer.combine(
             zipped_out, handle, async_finish=True, previous_event=deep_ep.Buffer.capture(),
             allocate_on_comm_stream=False, zip_done=zip_done)
@@ -700,11 +698,15 @@ class TeraMoENode:
         # 该 sort_map 使用的都是前向的数据, 所以与反向 dispatch 没有数据依赖
         x_w = deep_gemm.requant_wgrad_input(
             self.recv_x[0], self.recv_x[1].T.contiguous().T, self.ordered_to_zip)
+
+        # 复用 ordered_to_zip 给 sort_map, 这要求 sort_map 必须在 requant 完成后才执行
+        ordered_to_atomic = self.ordered_to_zip
         del self.recv_x, self.ordered_to_zip
+        _task_done_event.record()
+        _sort_map_stream.wait_event(_task_done_event)
 
         # 将反向 sort_map 用异步流紧跟在反向 dispatch 之后, 因为 dispatch 刚结束时 gemm 还没有立即切换到
         # compute 阶段, 此时 SM 有空余, 可以充分利用起来
-        ordered_to_atomic = paddle.empty([self.m_start_wgrad[-1]], dtype="int32")
         with paddle.device.stream_guard(_sort_map_stream):
             event.current_stream_wait()
             deep_gemm.sort_map(zip_to_atomic_bwd, self.m_start_gpu, self.m_start_wgrad[-1],
