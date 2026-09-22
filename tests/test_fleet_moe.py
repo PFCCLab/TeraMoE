@@ -109,10 +109,14 @@ def run_layer(moe_layer, hidden_states, out_grad, profile=None):
         out, _ = moe_layer(hidden_states.clone())
     out.backward(out_grad)
 
-    w1 = moe_layer.grouped_gemm_experts.weight1
-    w2 = moe_layer.grouped_gemm_experts.weight2
-    w1.grad.zero_()
-    w2.grad.zero_()
+    weight_grads = [
+        moe_layer.grouped_gemm_experts.weight1.grad,
+        moe_layer.grouped_gemm_experts.weight2.grad,
+        moe_layer.shared_experts.up_gate_proj.weight.grad,
+        moe_layer.shared_experts.down_proj.weight.grad,
+    ]
+    for t in weight_grads:
+        t.zero_()
     # 让 test 充分 overlap, 暴露出 overlap 可能存在的问题
     dist.all_reduce(paddle.empty([1]))
 
@@ -124,7 +128,7 @@ def run_layer(moe_layer, hidden_states, out_grad, profile=None):
     out.backward(out_grad)
 
     if profile is None:
-        return out, hidden_states.grad, w1.grad, w2.grad
+        return out, hidden_states.grad, *weight_grads
 
     # profile
     paddle.base.core.nvprof_nvtx_push(profile)
@@ -213,7 +217,7 @@ def main():
     teramoe_fused_a2a._buffer = None
     dist.barrier()
 
-    names = ["out", "hs_grad", "w1_grad", "w2_grad"]
+    names = ["out", "hs_grad", "w1_grad", "w2_grad", "shared_w1_grad", "shared_w2_grad"]
     ok = True
     for name, ref, tgt in zip(names, fleet_out, teramoe_out):
         diff = (ref.float() - tgt.float()).abs()
