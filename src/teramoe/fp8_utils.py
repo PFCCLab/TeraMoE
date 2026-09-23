@@ -19,8 +19,8 @@ class GroupedTaskLauncher:
     def __init__(self,
         funcs: list[Callable[[int], None]],
         num_tasks: int,
-        dispatch_done_event: deep_ep.EventOverlap,
-        combine_overlap_ratio: float = 0.3,
+        dispatch_done_event: deep_ep.EventOverlap | None = None,
+        combine_overlap_ratio: float = 0.0,
     ):
         self._funcs = funcs
         self._num_tasks = num_tasks
@@ -37,6 +37,8 @@ class GroupedTaskLauncher:
 
     def run_dispatch_overlap(self, dual_stream: bool = False):
         """Stage A: compute overlaps with dispatch util dispatch finishes."""
+        assert self._dispatch_done_event is not None, (
+            "dispatch_overlap requires dispatch_done_event be given")
         if dual_stream:
             return self._run_dispatch_overlap_dual_stream()
 
@@ -105,7 +107,7 @@ class GroupedTaskLauncher:
         使用两个 stream 可以让前后两个 kernel 重叠, 让下一个 kernel 充分利用上一个 kernel
         的尾部空出来的 SM, 达到类似 group_gemm 的效果.
         """
-        # 对于每组 func，总是从 calc_stream 开始发射，这样同一个 task_idx 的前后 func
+        # 对于每组 func，总是从主 stream 开始发射，这样同一个 task_idx 的前后 func
         # 必定在同一个 stream 上，可以天然保证同步
         stream_bases = [self._calc_stream.stream_base, _grouped_launch_stream.stream_base]
         i = 0
@@ -127,6 +129,10 @@ class GroupedTaskLauncher:
             # 每组 func 调用结束时恢复到默认计算流
             if i % 2 != 0:
                 paddle.base.core._set_current_stream(stream_bases[0])
+
+        # 仅结束时主 stream 需要等待一次副 stream
+        _task_done_event.record(_grouped_launch_stream)
+        self._calc_stream.wait_event(_task_done_event)
 
     def run_compute(self):
         """Stage B: compute only."""
@@ -206,6 +212,7 @@ def quant_input(x: Tensor) -> tuple[Tensor, Tensor]:
         using_ue8m0_scale=True,
     )
     assert x_fp8.shape == x.shape
+    scale = scale[:len(x)]  # 历史原因, scale 长度会向 4 对齐
     assert scale.shape == [x.shape[0], x.shape[1] // QUANT_BLOCK_SIZE]
     assert x_fp8.is_contiguous()
     assert scale.is_contiguous()
@@ -460,6 +467,10 @@ class TeraMoENode:
         self.recv_x = recv_x
         self.unzipped_probs = unzipped_probs
         self.zip_to_atomic = zip_to_atomic
+        if not self.fp8_wgrad:
+            self.recv_token_indices = recv_token_indices
+            self.tokens_per_expert = tokens_per_expert
+            self.handle = handle
 
         ############################# GEMM FORWARD #############################
 
@@ -521,8 +532,9 @@ class TeraMoENode:
 
         # 各专家 token 数重新向 512 对齐
         ks_cpu, m_start, m_start_wgrad = [], [0], [0]
+        wgrad_align = QUANT_BLOCK_SIZE if self.fp8_wgrad else FP8_ALIGN
         for n in tokens_per_expert:
-            ks_cpu.append((n + QUANT_BLOCK_SIZE - 1) // QUANT_BLOCK_SIZE * QUANT_BLOCK_SIZE)
+            ks_cpu.append((n + wgrad_align - 1) // wgrad_align * wgrad_align)
             m_start.append(m_start[-1] + (n + FP8_ALIGN - 1) // FP8_ALIGN * FP8_ALIGN)
             m_start_wgrad.append(m_start_wgrad[-1] + ks_cpu[-1])
         self.ks_cpu = ks_cpu
@@ -551,9 +563,14 @@ class TeraMoENode:
         This function accepts one input, but has no output in the same way as forward.
         """
         if self.fp8:
-            paddle.base.core.nvprof_nvtx_push("teramoe_fp8_bwd")
-            self._backward_fp8(dout)
-            paddle.base.core.nvprof_nvtx_pop()
+            if self.fp8_wgrad:
+                paddle.base.core.nvprof_nvtx_push("teramoe_fp8_bwd")
+                self._backward_fp8(dout)
+                paddle.base.core.nvprof_nvtx_pop()
+            else:
+                paddle.base.core.nvprof_nvtx_push("teramoe_fp8_bwd_bf16_wgrad")
+                self._backward_fp8_bf16_wgrad(dout)
+                paddle.base.core.nvprof_nvtx_pop()
         else:
             paddle.base.core.nvprof_nvtx_push("teramoe_bf16_bwd")
             self._backward_bf16(dout)
@@ -786,6 +803,136 @@ class TeraMoENode:
         fp8_weight_grad(o2_w, do3_w, w_down, self.ks_cpu, self.grouped_layout)
 
         paddle.base.core.nvprof_nvtx_pop()
+
+    def _backward_fp8_bf16_wgrad(self, dout: Tensor):
+        ########################### COMBINE BACKWARD ###########################
+
+        # 非 chunk 模式, 可以使用 cache mode, 发送 BF16
+        recv_dout, _, _, _, _, event = self.buffer.dispatch(
+            dout, handle=self.handle, async_finish=True, allocate_on_comm_stream=False)
+
+        w_gateup, w_down = self.w_gateup, self.w_down
+        H, I = w_gateup.shape[1], w_down.shape[1]
+        w_gateup_n = get_quant_weight(w_gateup)
+        w_down_n = get_quant_weight(w_down)
+
+        recv_indices = self.recv_token_indices.cast("int32")
+        drecv_probs = paddle.zeros(recv_indices.shape, dtype="float32")  # 留给后面用的
+        num_zipped_tokens = len(recv_indices)
+        num_unzipped_tokens = self.m_start_wgrad[-1]
+        m_indices = paddle.concat([
+            paddle.full([self.ks_cpu[i]], i, dtype="int32")
+            for i, n in enumerate(self.tokens_per_expert)
+        ])
+
+        # 将 recv_x dequant+unzip 与 dispatch 进行 overlap
+        recv_x_dequant = paddle.incubate.nn.functional.fused_act_dequant(*self.recv_x)
+        del self.recv_x
+
+        x_w, rowmap, _, _ = paddle.nn.functional.moe_permute(
+            recv_x_dequant, None, recv_indices, drecv_probs,
+            padding_alignment=FP8_ALIGN,
+            num_experts=len(w_gateup),
+            tokens_per_expert=self.tokens_per_expert,
+        )
+        del recv_x_dequant
+
+        # 构造一个按序的 task_queue, 每个专家一个 task
+        # NOTES: 跳过 0-size 的专家, 因为后面 chunk_size 不允许为 0
+        task_queue, task_chunk_size = [], []
+        for i, n in enumerate(self.tokens_per_expert):
+            if n > 0:
+                task_queue.append((i, self.m_start_wgrad[i], n, 1))
+                task_chunk_size.append(self.ks_cpu[i])
+        async_load = AsyncLoad()
+        task_queue = async_load(task_queue, dtype="int32")
+
+        event.current_stream_wait()
+
+        ############################ GEMM BACKWARD #############################
+
+        deep_gemm.set_num_sms(0)
+
+        # NOTES: paddle unzip 性能较差, 这里用重复读的 gather 性能都比它好, 而且实际运行时大部分 token
+        #        都只有一个专家, 重复读影响很小; 前面用 paddle 只是为了构造 rowmap 给后面的 zip 用
+        recv_dout_fp8, recv_dout_scale = quant_input(recv_dout)
+        do3_fp8 = deep_gemm.token_gather(recv_dout_fp8, self.ordered_to_zip)
+        do3_scale = deep_gemm.token_gather(recv_dout_scale, self.ordered_to_zip)
+        del recv_dout_fp8, recv_dout_scale
+
+        ########## DOWN_GRAD ###########
+
+        do2 = paddle.empty([num_unzipped_tokens, I], dtype="bfloat16")
+        deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
+            (do3_fp8, do3_scale.T.contiguous().T), w_down_n, do2, m_indices)
+        del do3_fp8, do3_scale
+
+        ######### SWIGLU_GRAD ##########
+
+        do1_fp8 = paddle.empty([num_unzipped_tokens, 2 * I], dtype="float8_e4m3fn")
+        do1_scale = paddle.empty([2 * I // QUANT_BLOCK_SIZE, num_unzipped_tokens], dtype="int32").T
+        o2_bwd_fp8 = paddle.empty([num_unzipped_tokens, I], dtype="float8_e4m3fn")  # 无用
+        o2_bwd_scale = paddle.empty([I // QUANT_BLOCK_SIZE, num_unzipped_tokens], dtype="int32").T
+
+        # 使用我们的 swiglu+quant 融合算子, 性能比 paddle 的分开算好
+        task = lambda task_idx: deep_gemm.chunk_weighted_swiglu_grad(
+            self.o1, self.unzipped_probs, do2, o2_bwd_fp8, do1_fp8, drecv_probs,
+            self.ordered_to_zip,  # 反向就是 ordered 序
+            self.zip_to_atomic, self.recv_token_indices, task_queue, task_idx,
+            task_chunk_size[task_idx],  # 每个 task 都使用其 m_size 对应的 chunk_size
+            o2_bwd_scales=o2_bwd_scale, do1_scales=do1_scale)
+
+        task_launcher = GroupedTaskLauncher([task], len(task_queue))
+        task_launcher.run_compute()
+        del o2_bwd_fp8, o2_bwd_scale
+
+        ######### GATEUP_GRAD ##########
+
+        dx = paddle.empty([num_unzipped_tokens, H], dtype="bfloat16")
+        deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
+            (do1_fp8, do1_scale), w_gateup_n, dx, m_indices)
+        del do1_fp8, do1_scale
+
+        dprobs = paddle.empty([num_unzipped_tokens], dtype="float32")  # 无用
+        drecv_x, _ = paddle.nn.functional.moe_unpermute(
+            dx, rowmap, recv_indices, dprobs, total_zipped_tokens=num_zipped_tokens,
+            num_experts=len(w_gateup))
+        del dx, rowmap, dprobs
+
+        ########################## DISPATCH BACKWARD ###########################
+
+        dhidden_states, dtoken_probs, event = self.buffer.combine(
+            drecv_x, self.handle, drecv_probs, async_finish=True, allocate_on_comm_stream=False)
+
+        self.input_grads = (dhidden_states, dtoken_probs)
+        self.combine_done_event = event
+
+        ################################ WGRAD #################################
+
+        paddle.base.core.nvprof_nvtx_push("wgrad")
+        deep_gemm.set_num_sms(self.num_calc_sms)
+
+        # do1 和 o2 需要重算, 因为前面算的是 fp8 的
+        do1 = paddle.empty([num_unzipped_tokens, 2 * I], dtype="bfloat16")
+        o2_bwd = paddle.empty([num_unzipped_tokens, I], dtype="bfloat16")
+        drecv_probs_tmp = paddle.empty_like(drecv_probs)  # 无用
+        task = lambda task_idx: deep_gemm.chunk_weighted_swiglu_grad(
+            self.o1, self.unzipped_probs, do2, o2_bwd, do1, drecv_probs_tmp,
+            self.ordered_to_zip, self.zip_to_atomic, self.recv_token_indices,
+            task_queue, task_idx, task_chunk_size[task_idx])
+
+        task_launcher = GroupedTaskLauncher([task], len(task_queue))
+        task_launcher.run_compute()
+        del self.o1, self.unzipped_probs, do2, drecv_probs_tmp
+
+        bf16_weight_grad(x_w, do1, w_gateup, self.ks_cpu, self.grouped_layout)
+        del x_w, do1
+
+        do3 = deep_gemm.token_gather(recv_dout, self.ordered_to_zip)
+        bf16_weight_grad(o2_bwd, do3, w_down, self.ks_cpu, self.grouped_layout)
+
+        paddle.base.core.nvprof_nvtx_pop()
+
 
     def backward_wait(self) -> [Tensor, Tensor]:
         """Wait for combine to finish and return the combined result."""

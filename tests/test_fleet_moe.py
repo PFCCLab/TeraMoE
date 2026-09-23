@@ -32,6 +32,7 @@ SEQLEN = 16384
 NUM_COMM_SMS = 52
 NUM_CALC_SMS = 96
 USE_FP8 = False
+USE_FP8_WGRAD = False
 LONG_RUN = 0
 
 
@@ -85,7 +86,7 @@ class TeraMoELayer(MoELayer):
             self.moe_group,
             combine_overlap_handle,
             fp8=self.config.fp8,
-            fp8_wgrad=self.config.fp8_wgrad,
+            fp8_wgrad=USE_FP8_WGRAD,
             use_ue8m0=self.config.use_ue8m0,
             num_calc_sms=NUM_CALC_SMS,
         )
@@ -196,7 +197,7 @@ def check(fleet_out, teramoe_out):
         avg, max = float(diff.mean()), float(diff.max())
         if max == 0:
             print(f"{name}: 0.0")
-        elif USE_FP8:
+        elif USE_FP8 and USE_FP8_WGRAD:
             # wgrad 的绝对误差比较大，只能比较 cos 相似性
             cos = float(F.cosine_similarity(ref.flatten(), tgt.flatten(), axis=0, eps=0))
             print(f"{name}: avg={avg:e} max={max:e} cos={cos:.6f}")
@@ -307,10 +308,12 @@ def main():
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--fp8", action="store_true", help="Use fp8")
+    parser.add_argument("--fp8-wgrad", action="store_true", help="Use fp8 wgrad")
     parser.add_argument("--long-run", type=int, default=0, help="Specify long-run steps")
     args = parser.parse_args()
 
     USE_FP8 = args.fp8
+    USE_FP8_WGRAD = args.fp8_wgrad
     LONG_RUN = args.long_run
 
     main()
