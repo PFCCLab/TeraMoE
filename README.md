@@ -59,16 +59,16 @@ hidden_states = teramoe.forward_autograd(
 
 ## 单测
 
-在`tests/`下面有 TeraMoE 串起来的前反向单测，用于测试整个系统的正确性和性能，需要分布式环境：
+在`tests/`下面有将 TeraMoE 串起来的前反向单测，用于测试整个系统的正确性和性能，需要分布式环境：
 
 ```bash
 cd tests
-mpirun python run.py 0,1 test_fleet_moe.py  # --fp8 --long-run 100
+mpirun python run.py 0,1 test_fleet_moe.py  # --fp8 --fp8-wgrad --long-run 100
 ```
 
 在`third_party/DeepEP/tests_overlap/`下面有 DeepEP 的分布式单测，目前功能与`tests/`重合较高，仅供 DeepEP 分支维护用
 
-在`third_party/DeepGEMM/tests_overlap/`下面有 DeepGEMM 的单卡单测，测试了 DeepGEMM 各算子在各类配置下的情况，是性能调优的重要工具
+在`third_party/DeepGEMM/tests_overlap/`下面有 DeepGEMM 的单卡单测，测试了 DeepGEMM 各算子在各类配置下的情况，是计算算子性能调优的重要工具
 
 
 ## Acknowledgement

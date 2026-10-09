@@ -826,7 +826,10 @@ class TeraMoENode:
         ])
 
         # 将 recv_x dequant+unzip 与 dispatch 进行 overlap
-        recv_x_dequant = paddle.incubate.nn.functional.fused_act_dequant(*self.recv_x)
+        if self.recv_x[0].shape[0] > 0:
+            recv_x_dequant = paddle.incubate.nn.functional.fused_act_dequant(*self.recv_x)
+        else:
+            recv_x_dequant = paddle.empty(self.recv_x[0].shape, dtype="bfloat16")
         del self.recv_x
 
         x_w, rowmap, _, _ = paddle.nn.functional.moe_permute(
@@ -932,7 +935,6 @@ class TeraMoENode:
         bf16_weight_grad(o2_bwd, do3, w_down, self.ks_cpu, self.grouped_layout)
 
         paddle.base.core.nvprof_nvtx_pop()
-
 
     def backward_wait(self) -> [Tensor, Tensor]:
         """Wait for combine to finish and return the combined result."""
