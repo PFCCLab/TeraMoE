@@ -197,12 +197,13 @@ def check(fleet_out, teramoe_out):
         avg, max = float(diff.mean()), float(diff.max())
         if max == 0:
             print(f"{name}: 0.0")
-        elif USE_FP8 and USE_FP8_WGRAD:
+        elif ref.dtype == paddle.float32 and USE_FP8 and USE_FP8_WGRAD:
             # wgrad 的绝对误差比较大，只能比较 cos 相似性
             cos = float(F.cosine_similarity(ref.flatten(), tgt.flatten(), axis=0, eps=0))
             print(f"{name}: avg={avg:e} max={max:e} cos={cos:.6f}")
             ok = ok and cos > 0.999
         else:
+            print(f"{name}: avg={avg:e} max={max:e}")
             ok = False
     return ok
 
@@ -310,6 +311,7 @@ if __name__ == "__main__":
     parser.add_argument("--fp8", action="store_true", help="Use fp8")
     parser.add_argument("--fp8-wgrad", action="store_true", help="Use fp8 wgrad")
     parser.add_argument("--long-run", type=int, default=0, help="Specify long-run steps")
+    parser.add_argument("args", nargs="*", help="Unused args")
     args = parser.parse_args()
 
     USE_FP8 = args.fp8
