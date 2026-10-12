@@ -29,6 +29,7 @@ for name in list(os.environ):
         del os.environ[name]
 
 os.environ["HOME"] = os.getcwd()  # deep_gemm cache
+os.environ["SONIC_MOE_CACHE_DIR"] = os.getcwd()
 os.environ["FLAGS_use_virtual_memory_auto_growth"] = "1"
 
 master = hosts[ranks[0]]

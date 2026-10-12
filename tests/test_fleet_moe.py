@@ -16,7 +16,6 @@ import teramoe.fused_a2a as teramoe_fused_a2a
 # use develop paddlefleet
 FLEET_PATH = os.path.realpath("../../erniebot_test_speed/third_party/PaddleFleet/src")
 sys.path.insert(0, FLEET_PATH)
-os.environ["FLEET_MOE_EP_BARRIER_ASYNC"] = "1"
 import paddlefleet
 assert paddlefleet.__path__[0] == os.path.join(FLEET_PATH, "paddlefleet"), (
     f"Unexpected paddlefleet path: {paddlefleet.__path__[0]}")
@@ -33,6 +32,7 @@ NUM_COMM_SMS = 52
 NUM_CALC_SMS = 96
 USE_FP8 = False
 USE_FP8_WGRAD = False
+USE_SONIC_MOE = False
 LONG_RUN = 0
 
 
@@ -89,6 +89,7 @@ class TeraMoELayer(MoELayer):
             fp8_wgrad=USE_FP8_WGRAD,
             use_ue8m0=self.config.use_ue8m0,
             num_calc_sms=NUM_CALC_SMS,
+            combine_overlap_ratio=0.1,
         )
 
         if self.use_latent_moe:
@@ -100,6 +101,9 @@ class TeraMoELayer(MoELayer):
 
 
 def run_layer(moe_layer, hidden_states, out_grad, profile=None):
+    # 如果在 moe_router.py 里给 bias 加了随机不均衡, 每次 run 使用相同的随机顺序
+    paddle.cuda.manual_seed(0)
+
     if USE_FP8:
         moe_layer.fp8_quant_weight(batch_mode=True)
 
@@ -174,7 +178,7 @@ def run_layer_long(moe_layer, hidden_states):
         with paddle.amp.auto_cast(enable=True, dtype="bfloat16"):
             out, _ = moe_layer(hidden_states_t)
 
-        # 我们把 "所有完成 rank 完成" 才视为完成, 因为在多层网络里面只有一层完成无意义
+        # 把所有完成 rank 完成才视为完成, 因为在多层网络里只有一层的所有 rank 完成才能进入下一层
         dist.all_reduce(paddle.empty([1]))
         events[1].record()
 
@@ -232,6 +236,8 @@ def main():
         sigmoid_gate_fusion=True,
         moe_expert_fusion=True,
         moe_shared_expert_overlap=True,
+        using_sonic_moe=USE_SONIC_MOE,
+        hidden_act=F.silu,
         # hidden_act="situ",
         # situ_glu_fusion=True,
         # situ_glu_plain_fusion=True,
@@ -259,6 +265,19 @@ def main():
 
     fleet_out = run_layer(moe_layer, hidden_states, out_grad)
 
+    # sonicmoe 很多 layout 和 teramoe 不一样, 没法比, 因此跑完就返回
+    if USE_SONIC_MOE:
+        del fleet_out
+        dist.barrier()
+        paddle.base.core.nvprof_start()
+
+        for i in range(2):
+            run_layer(moe_layer, hidden_states, out_grad, profile="fleet")
+
+        dist.barrier()
+        paddle.base.core.nvprof_stop()
+        return
+
     fleet_fused_a2a._buffer = None
     dist.barrier()
 
@@ -285,7 +304,8 @@ def main():
     moe_layer = paddle.amp.decorate(moe_layer, level="O2", dtype="bfloat16")
     moe_layer.set_state_dict(state_dict)
 
-    run_layer(moe_layer, hidden_states, out_grad, profile="fleet")
+    for i in range(2):
+        run_layer(moe_layer, hidden_states, out_grad, profile="fleet")
 
     fleet_fused_a2a._buffer = None
     dist.barrier()
@@ -310,12 +330,18 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--fp8", action="store_true", help="Use fp8")
     parser.add_argument("--fp8-wgrad", action="store_true", help="Use fp8 wgrad")
+    parser.add_argument("--sonic-moe", action="store_true", help="Use sonic moe for baseline")
     parser.add_argument("--long-run", type=int, default=0, help="Specify long-run steps")
     parser.add_argument("args", nargs="*", help="Unused args")
     args = parser.parse_args()
 
     USE_FP8 = args.fp8
     USE_FP8_WGRAD = args.fp8_wgrad
+    USE_SONIC_MOE = args.sonic_moe
     LONG_RUN = args.long_run
+
+    # 不使用 sonicmoe 时, 可以去掉 barrier_ep; sonicmoe 则因为 jit 太慢了不能去掉
+    if not USE_SONIC_MOE:
+        os.environ["FLEET_MOE_EP_BARRIER_ASYNC"] = "1"
 
     main()
