@@ -29,7 +29,6 @@ from paddlefleet.transformer.transformer_config import TransformerConfig
 
 SEQLEN = 16384
 NUM_COMM_SMS = 52
-NUM_CALC_SMS = 96
 USE_FP8 = False
 USE_FP8_WGRAD = False
 USE_SONIC_MOE = False
@@ -88,8 +87,6 @@ class TeraMoELayer(MoELayer):
             fp8=self.config.fp8,
             fp8_wgrad=USE_FP8_WGRAD,
             use_ue8m0=self.config.use_ue8m0,
-            num_calc_sms=NUM_CALC_SMS,
-            combine_overlap_ratio=0.1,
         )
 
         if self.use_latent_moe:
@@ -190,7 +187,10 @@ def run_layer_long(moe_layer, hidden_states):
         paddle.device.synchronize()
         fwd_time = events[0].elapsed_time(events[1])
         bwd_time = events[1].elapsed_time(events[2])
-        print(end=f"{i + 1}\t{fwd_time}\t{bwd_time}\n", flush=True)
+        row = [i + 1, fwd_time, bwd_time]
+        if isinstance(moe_layer, TeraMoELayer):
+            row.append(teramoe.comm_manager.tokens_per_card_max_mean_ratio)
+        print(*row, sep="\t")
 
 
 def check(fleet_out, teramoe_out):
@@ -214,8 +214,7 @@ def check(fleet_out, teramoe_out):
 
 def main():
     group = initialize_fleet()
-    fleet_fused_a2a.configure_buffer(52)
-    teramoe.configure_buffer(NUM_COMM_SMS)
+    fleet_fused_a2a.configure_buffer(NUM_COMM_SMS)
 
     config = TransformerConfig(
         hidden_size=4096,

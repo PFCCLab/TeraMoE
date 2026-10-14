@@ -1,9 +1,13 @@
+import sys
+
 import paddle
 from paddle.distributed.communication.group import Group
 
-from teramoe import deep_ep
+from . import deep_ep
 
 _buffer = None
+_is_configured = False
+_num_calc_sms = None
 
 
 def get_hidden_bytes(x: paddle.Tensor) -> int:
@@ -31,6 +35,8 @@ def configure_buffer(num_sms=None, dispatch_config=None, combine_config=None):
             Trailing values may be omitted to use the defaults.
         combine_config (List[int]): Same as above, but for combine kernels.
     """
+    global _is_configured
+    _is_configured = True
     if num_sms is not None:
         deep_ep.Buffer.set_num_sms(num_sms)
     if dispatch_config is not None:
@@ -41,6 +47,27 @@ def configure_buffer(num_sms=None, dispatch_config=None, combine_config=None):
         deep_ep.Buffer.get_combine_config = staticmethod(
             lambda _: deep_ep.Config(deep_ep.Buffer.num_sms, *combine_config)
         )
+
+
+def infer_buffer_config() -> int:
+    """Copy buffer config from paddlefleet_ops if not configured."""
+    global _is_configured, _num_calc_sms
+
+    if not _is_configured:
+        if "paddlefleet_ops.deep_ep" in sys.modules:
+            import paddlefleet_ops.deep_ep as fleet_deep_ep
+            deep_ep.Buffer.set_num_sms(fleet_deep_ep.Buffer.num_sms)
+            if isinstance(fleet_deep_ep.Buffer.get_dispatch_config, staticmethod):
+                deep_ep.Buffer.get_dispatch_config = fleet_deep_ep.Buffer.get_dispatch_config
+            if isinstance(fleet_deep_ep.Buffer.get_combine_config, staticmethod):
+                deep_ep.Buffer.get_combine_config = fleet_deep_ep.Buffer.get_combine_config
+        _is_configured = True
+
+    if _num_calc_sms is None:
+        num_sms = paddle.device.get_device_properties().multi_processor_count
+        _num_calc_sms = num_sms - deep_ep.Buffer.num_sms
+
+    return _num_calc_sms
 
 
 def get_buffer(group: Group, hidden_bytes: int):

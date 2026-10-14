@@ -8,7 +8,7 @@ from paddle.autograd import PyLayer
 from paddle.distributed.communication.group import Group
 
 from .fp8_utils import FP8_ALIGN, TeraMoENode
-from .fused_a2a import get_buffer, get_hidden_bytes
+from .fused_a2a import get_buffer, get_hidden_bytes, infer_buffer_config
 
 
 if TYPE_CHECKING:
@@ -78,6 +78,16 @@ class PostFnNode(PyLayer):
         return paddle.empty([0]), *fn_out_grads
 
 
+class CommManager:
+    dispatched_indices: Tensor | None = None
+    dispatched_probs: Tensor | None = None
+    tokens_per_expert: list[int] | None = None
+    tokens_per_card_max_mean_ratio: float | None = None
+
+
+comm_manager = CommManager()
+
+
 def forward_autograd(
     hidden_states: Tensor,
     topk_weights: Tensor,
@@ -87,21 +97,48 @@ def forward_autograd(
     group: Group,
     combine_overlap_handle: _CombineOverlapHandle | None = None,
     hidden_act: Literal["silu"] = "silu",
+    activation_type: Literal["swiglu"] | None = None,
     fp8: Literal["e4m3"] | None = None,
     fp8_wgrad: bool = True,
     use_ue8m0: bool = True,
     chunk_size: int = 4096,
-    num_calc_sms: int = 100,
-    combine_overlap_ratio: float = 0.3,
+    num_calc_sms: int | None = None,
+    combine_overlap_ratio: float = 0.1,
 ):
+    """
+    Autograd wrapper for TeraMoE.
+
+    Args:
+        hidden_states (Tensor): Input data.
+        topk_weights (Tensor): Topk expert scores.
+        topk_indices (Tensor): Topk expert indices.
+        grouped_gemm_experts (_GroupedGemmExpert): Fused expert weights.
+        num_experts (int): Number of global experts.
+        group (Group): The EP communication group.
+        combine_overlap_handle (_CombineOverlapHandle, optional): Shared expert handle to overlap with combine. Default is None.
+        hidden_act (str, optional): Activation function for non-linearity in MLP.
+        activation_type (str, optional): Alias for hidden_act, but uses different names. Default is None.
+        fp8 (str, optional): The fp8 data type. Default is None, which uses bf16.
+        fp8_wgrad (bool, optional): Whether to use fp8 in weight grad. Default is True.
+        use_ue8m0 (bool, optional): Whether to use ue8m0 scale. Default is True.
+        chunk_size (int, optional): Number of tokens in each task. Default is 4096.
+        num_calc_sms (int, optional): Number of SMs for compute. If not given, infers from the deep_ep config. Default is None.
+        combine_overlap_ratio (float, optional): Ratio of tasks to overlap with combine.
+    """
     # Check params
-    assert hidden_act == "silu", f"Only supports silu activation, got {hidden_act}."
+    if activation_type is None:
+        assert hidden_act == "silu", f"Only supports silu activation, got {hidden_act}."
+    else:
+        assert activation_type == "swiglu", f"Only supports swiglu activation, got {activation_type}."
     assert fp8 is None or fp8 == "e4m3", f"Only supports fp8 e4m3, got {fp8}."
     assert fp8 is None or use_ue8m0, f"Only supports ue8m0 scale."
     assert isinstance(chunk_size, int) and chunk_size > 0 and chunk_size % FP8_ALIGN == 0, (
         f"The chunk_size must be multiple of {FP8_ALIGN}, got {chunk_size}.")
-    assert isinstance(num_calc_sms, int) and num_calc_sms > 0, (
-        f"The num_calc_sms must be positive integer, got {num_calc_sms}.")
+    if num_calc_sms is None:
+        num_calc_sms = infer_buffer_config()
+    else:
+        assert isinstance(num_calc_sms, int) and num_calc_sms > 0, (
+            f"The num_calc_sms must be positive integer, got {num_calc_sms}.")
     assert isinstance(combine_overlap_ratio, (int, float)) and 0 <= combine_overlap_ratio <= 1, (
         f"The combine_overlap_ratio must be in range [0, 1], got {combine_overlap_ratio}.")
 
@@ -131,7 +168,7 @@ def forward_autograd(
     # 2. 由于前向我们用 pre/post 两个节点夹住了 combine_overlap_handle 的计算, 因此能够保证
     #    其反向恰好在 post 与 pre 之间执行, 从而也能控制它与 combine 进行 overlap
     node = TeraMoENode(
-        buffer, hs_2d, topk_weights, topk_indices, w_gateup, w_down, num_experts,
+        buffer, hs_2d, topk_weights, topk_indices, w_gateup, w_down, group, num_experts,
         fp8, fp8_wgrad, chunk_size, num_calc_sms, combine_overlap_ratio)
 
     fn_args, fn_out = (), ()
@@ -146,5 +183,8 @@ def forward_autograd(
     out, *fn_out = PostFnNode.apply(fake_state, node, *fn_out)
     if combine_overlap_handle is not None:
         combine_overlap_handle["fn_out"] = fn_out
+
+    comm_manager.tokens_per_expert = node.tokens_per_expert
+    comm_manager.tokens_per_card_max_mean_ratio = node.tokens_per_card_max_mean_ratio
 
     return out

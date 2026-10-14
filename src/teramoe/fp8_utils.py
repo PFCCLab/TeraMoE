@@ -1,6 +1,7 @@
 from typing import Callable
 
 import paddle
+import paddle.distributed as dist
 from paddle import Tensor
 from paddle.distributed.communication.group import Group
 
@@ -21,11 +22,13 @@ class GroupedTaskLauncher:
         num_tasks: int,
         dispatch_done_event: deep_ep.EventOverlap | None = None,
         combine_overlap_ratio: float = 0.0,
+        avg_num_tasks: int = None,
     ):
         self._funcs = funcs
         self._num_tasks = num_tasks
         self._dispatch_done_event = dispatch_done_event
         self._combine_overlap_ratio = combine_overlap_ratio
+        self._avg_num_tasks = num_tasks if avg_num_tasks is None else avg_num_tasks
         self._next_task_idx = 0
         self._calc_stream = paddle.cuda.current_stream()
 
@@ -137,7 +140,10 @@ class GroupedTaskLauncher:
     def run_compute(self):
         """Stage B: compute only."""
         begin = self._next_task_idx
-        end = max(int(self._num_tasks * (1 - self._combine_overlap_ratio)), begin)  # excluded
+        # 将 combine_overlap_ratio 的 task 留给 combine 进行 overlap, 但是 task 基数由均衡
+        # 情况确定, 以此保持留出的 task 数量恒定 (而不是比例恒定)
+        num_overlap_tasks = self._avg_num_tasks * self._combine_overlap_ratio
+        end = max(int(self._num_tasks - num_overlap_tasks), begin)  # excluded
 
         if begin < end:
             paddle.base.core.nvprof_nvtx_push(f"B{begin}_{end - 1}")
@@ -203,17 +209,42 @@ class AsyncLoad:
         self.wait()
 
 
-def quant_input(x: Tensor) -> tuple[Tensor, Tensor]:
+def async_offload(x: Tensor) -> Tensor:
+    """Copy x to pin_memory asynchronously."""
+    assert x.dtype == paddle.int32 and x.place.is_gpu_place()
+
+    pin = paddle.core.DenseTensor()
+    pin._set_dims(x.shape)
+    pin._alloc_int(paddle.CUDAPinnedPlace())
+
+    cudart = paddle.cuda.cudart()
+    stream = paddle.cuda.current_stream()
+
+    err = cudart.cudaMemcpyAsync(
+        pin._ptr(),
+        x.data_ptr(),
+        x.size * x.itemsize,
+        cudart.cudaMemcpyDeviceToHost,
+        stream.stream_base.cuda_stream,
+    )
+    assert err == cudart.cudaError.success, f"cudaMemcpyAsync failed: {err}"
+
+    out = paddle.Tensor()
+    out.get_tensor()._share_data_nocheck_with(pin)
+    return out
+
+
+def quant_input(x: Tensor, transpose_scale: bool = False) -> tuple[Tensor, Tensor]:
     """对于 hidden_states, 在 hidden 维上使用 128 分块量化."""
     x_fp8, scale = paddle.incubate.nn.functional.fp8_quant_blockwise(
         x,
         quant_method="1x128",
-        output_scale_transpose=False,
+        output_scale_transpose=transpose_scale,
         using_ue8m0_scale=True,
     )
     assert x_fp8.shape == x.shape
-    scale = scale[:len(x)]  # 历史原因, scale 长度会向 4 对齐
-    assert scale.shape == [x.shape[0], x.shape[1] // QUANT_BLOCK_SIZE]
+    scale_shape = [x.shape[0], x.shape[1] // QUANT_BLOCK_SIZE]
+    assert scale.shape == scale_shape[::-1] if transpose_scale else scale_shape
     assert x_fp8.is_contiguous()
     assert scale.is_contiguous()
     return x_fp8, scale
@@ -292,6 +323,7 @@ class TeraMoENode:
         token_indices: Tensor,
         w_gateup: Tensor,
         w_down: Tensor,
+        group: Group,
         num_experts: int,
         fp8: str,
         fp8_wgrad: bool,
@@ -305,12 +337,28 @@ class TeraMoENode:
         self.token_indices = token_indices
         self.w_gateup = w_gateup
         self.w_down = w_down
+        self.group = group
         self.num_experts = num_experts
         self.fp8 = fp8
         self.fp8_wgrad = fp8_wgrad
         self.chunk_size = chunk_size
         self.num_calc_sms = num_calc_sms
         self.combine_overlap_ratio = combine_overlap_ratio
+        self.tokens_per_expert = None
+        self.tokens_per_card_max_mean_ratio = None
+
+    def _reduce_max_tokens_per_card(self, num_tokens_per_expert: Tensor) -> Tensor:
+        """归约当前 ep_group 内每个 rank 的展开 token 数的最大值, 用于统计均衡度.
+
+        NOTES:
+            1. 通信量为 ep_size 个 int, 成本极低;
+            2. 同时起到了 barrier_ep 的作用;
+            3. 返回值由 notify_dispatch 天然同步, 需要在调用完 dispatch 后才能使用.
+        """
+        global_num_tokens_per_card = num_tokens_per_expert.reshape(
+            [self.group.nranks, -1]).sum(axis=1, dtype="int32")
+        dist.all_reduce(global_num_tokens_per_card, group=self.group)
+        return async_offload(global_num_tokens_per_card.max())
 
     def forward(self):
         """Forward dispatch, compute and combine.
@@ -343,6 +391,8 @@ class TeraMoENode:
             allocate_on_comm_stream=False,
         )
 
+        max_tokens_per_card = self._reduce_max_tokens_per_card(num_tokens_per_expert)
+
         self.dispatch_layout = {
             "num_tokens_per_rank": num_tokens_per_rank,
             "num_tokens_per_rdma_rank": num_tokens_per_rdma_rank,
@@ -351,8 +401,7 @@ class TeraMoENode:
         }
 
         (
-            recv_x, recv_token_indices, recv_token_probs,
-            num_recv_tokens_per_expert_list, handle, event,
+            recv_x, recv_token_indices, recv_token_probs, tokens_per_expert, handle, event,
             unzipped_tokens, unzipped_probs, atomic_to_zip, zip_to_atomic,
             num_valid_topk, task_queue,
         ) = self.buffer.dispatch(
@@ -365,6 +414,10 @@ class TeraMoENode:
             unzip_alignment=FP8_ALIGN,
             unzip_chunk_size=self.chunk_size,
         )
+
+        self.tokens_per_expert = tokens_per_expert
+        avg_tokens_per_card = self.token_indices.size  # seqlen * topk
+        self.tokens_per_card_max_mean_ratio = max_tokens_per_card.item() / avg_tokens_per_card
 
         del self.hidden_states
         self.recv_x = recv_x
@@ -386,6 +439,8 @@ class TeraMoENode:
         token_done = paddle.zeros([num_recv_tokens], dtype="int32")
         zip_done = paddle.zeros([num_recv_tokens], dtype="int32")
 
+        avg_num_tasks = int(avg_tokens_per_card / self.chunk_size + len(w_gateup) / 2)
+
         funcs = [
             lambda task_idx: deep_gemm.bf16_chunk_gemm_nn(
                 unzipped_tokens, w_gateup, o1, task_queue, task_idx),
@@ -398,7 +453,7 @@ class TeraMoENode:
         ]
 
         task_launcher = GroupedTaskLauncher(
-            funcs, len(task_queue), event, self.combine_overlap_ratio)
+            funcs, len(task_queue), event, self.combine_overlap_ratio, avg_num_tasks)
 
         deep_gemm.set_num_sms(self.num_calc_sms)
         task_launcher.run_dispatch_overlap()
@@ -438,6 +493,8 @@ class TeraMoENode:
             allocate_on_comm_stream=False,
         )
 
+        max_tokens_per_card = self._reduce_max_tokens_per_card(num_tokens_per_expert)
+
         self.dispatch_layout = {
             "num_tokens_per_rank": num_tokens_per_rank,
             "num_tokens_per_rdma_rank": num_tokens_per_rdma_rank,
@@ -463,13 +520,16 @@ class TeraMoENode:
         unzipped_tokens, unzipped_scale = unzipped_tokens
         unzipped_x = (unzipped_tokens, unzipped_scale.T)
 
+        self.tokens_per_expert = tokens_per_expert
+        avg_tokens_per_card = self.token_indices.size
+        self.tokens_per_card_max_mean_ratio = max_tokens_per_card.item() / avg_tokens_per_card
+
         del hidden_states
         self.recv_x = recv_x
         self.unzipped_probs = unzipped_probs
         self.zip_to_atomic = zip_to_atomic
         if not self.fp8_wgrad:
             self.recv_token_indices = recv_token_indices
-            self.tokens_per_expert = tokens_per_expert
             self.handle = handle
 
         ############################# GEMM FORWARD #############################
@@ -491,6 +551,8 @@ class TeraMoENode:
         token_done = paddle.zeros([num_recv_tokens], dtype="int32")
         zip_done = paddle.zeros([num_recv_tokens], dtype="int32")
 
+        avg_num_tasks = int(avg_tokens_per_card / self.chunk_size + len(w_gateup) / 2)
+
         funcs = [
             lambda task_idx: deep_gemm.fp8_chunk_gemm_nt(
                 unzipped_x, w_gateup_t, o1, task_queue, task_idx),
@@ -505,7 +567,7 @@ class TeraMoENode:
         ]
 
         task_launcher = GroupedTaskLauncher(
-            funcs, len(task_queue), event, self.combine_overlap_ratio)
+            funcs, len(task_queue), event, self.combine_overlap_ratio, avg_num_tasks)
 
         deep_gemm.set_num_sms(self.num_calc_sms)
         task_launcher.run_dispatch_overlap()
@@ -516,8 +578,8 @@ class TeraMoENode:
         ########################### COMBINE FORWARD ############################
 
         out, _, event = self.buffer.combine(
-            zipped_out, handle, async_finish=True, previous_event=deep_ep.Buffer.capture(),
-            allocate_on_comm_stream=False, zip_done=zip_done)
+            zipped_out, handle, async_finish=True, allocate_on_comm_stream=False,
+            zip_done=zip_done)
 
         deep_gemm.set_num_sms(self.num_calc_sms)
         task_launcher.run_combine_overlap()
@@ -775,8 +837,7 @@ class TeraMoENode:
                 num_valid_topk, token_done, zip_done, task_queue, task_idx, self.chunk_size),
         ]
 
-        task_launcher = GroupedTaskLauncher(
-            funcs, len(task_queue), event, self.combine_overlap_ratio)
+        task_launcher = GroupedTaskLauncher(funcs, len(task_queue), event)
 
         deep_gemm.set_num_sms(self.num_calc_sms)
         task_launcher.run_dispatch_overlap()
@@ -787,12 +848,10 @@ class TeraMoENode:
         ########################## DISPATCH BACKWARD ###########################
 
         dhidden_states, dtoken_probs, event = self.buffer.combine(
-            drecv_x, handle, drecv_probs, async_finish=True,
-            previous_event=deep_ep.Buffer.capture(), allocate_on_comm_stream=False,
-            zip_done=zip_done)
+            drecv_x, handle, drecv_probs, async_finish=True, allocate_on_comm_stream=False)
 
         deep_gemm.set_num_sms(self.num_calc_sms)
-        task_launcher.run_combine_overlap()
+        # NOTES: 反向不使用 combine overlap, 因为已经有计算量较大的 wgrad, 足以填满甚至超出 combine
 
         del self.o1, self.unzipped_probs, self.zip_to_atomic
         self.input_grads = (dhidden_states, dtoken_probs)
@@ -863,7 +922,7 @@ class TeraMoENode:
         # NOTES: 先 unzip 再 quant, 因为 paddle quant 算子在非对齐情况性能较差
         do3 = deep_gemm.token_gather(self.recv_dout, self.ordered_to_zip)
         del self.recv_dout
-        do3_fp8, do3_scale = quant_input(do3)
+        do3_fp8, do3_scale = quant_input(do3, transpose_scale=True)
 
         ########## DOWN_GRAD ###########
 
@@ -873,7 +932,7 @@ class TeraMoENode:
 
         do2 = paddle.empty([num_unzipped_tokens, I], dtype="bfloat16")
         deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
-            (do3_fp8, do3_scale.T.contiguous().T), w_down_n, do2, self.m_indices)
+            (do3_fp8, do3_scale.T), w_down_n, do2, self.m_indices)
         del do3_fp8, do3_scale
 
         ######### SWIGLU_GRAD ##########
@@ -882,13 +941,13 @@ class TeraMoENode:
             self.o1, do2, self.unzipped_probs, inplace=True)
         del self.o1, do2, self.unzipped_probs
 
-        do1_fp8, do1_scale = quant_input(do1)
+        do1_fp8, do1_scale = quant_input(do1, transpose_scale=True)
 
         ######### GATEUP_GRAD ##########
 
         dx = paddle.empty([num_unzipped_tokens, H], dtype="bfloat16")
         deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
-            (do1_fp8, do1_scale.T.contiguous().T), w_gateup_n, dx, self.m_indices)
+            (do1_fp8, do1_scale.T), w_gateup_n, dx, self.m_indices)
         del do1_fp8, do1_scale
 
         drecv_x, drecv_probs = paddle.nn.functional.moe_unpermute(
