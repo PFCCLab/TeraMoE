@@ -47,7 +47,7 @@ cmd = [
     "--master", f"{master}:{port}",
     "--rank", str(rank), "--nnodes", str(nnodes),
     "--run_mode=collective",
-    args.file, *args.args,
+    args.file, *args.args, "grep",
 ]
 
 if args.nsys:

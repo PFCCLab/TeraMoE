@@ -79,8 +79,6 @@ class PostFnNode(PyLayer):
 
 
 class CommManager:
-    dispatched_indices: Tensor | None = None
-    dispatched_probs: Tensor | None = None
     tokens_per_expert: list[int] | None = None
     tokens_per_card_max_mean_ratio: float | None = None
 
@@ -96,6 +94,7 @@ def forward_autograd(
     num_experts: int,
     group: Group,
     combine_overlap_handle: _CombineOverlapHandle | None = None,
+    custom_map: Any = None,
     hidden_act: Literal["silu"] = "silu",
     activation_type: Literal["swiglu"] | None = None,
     fp8: Literal["e4m3"] | None = None,
@@ -116,6 +115,7 @@ def forward_autograd(
         num_experts (int): Number of global experts.
         group (Group): The EP communication group.
         combine_overlap_handle (_CombineOverlapHandle, optional): Shared expert handle to overlap with combine. Default is None.
+        custom_map (MoELayer): Custom mapping for extra configs.
         hidden_act (str, optional): Activation function for non-linearity in MLP.
         activation_type (str, optional): Alias for hidden_act, but uses different names. Default is None.
         fp8 (str, optional): The fp8 data type. Default is None, which uses bf16.
