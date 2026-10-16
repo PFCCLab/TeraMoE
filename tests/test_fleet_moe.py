@@ -22,6 +22,7 @@ assert paddlefleet.__path__[0] == os.path.join(FLEET_PATH, "paddlefleet"), (
 from paddlefleet.process_groups_config import ProcessGroupCollection
 from paddlefleet.tensor_parallel import ColumnParallelLinear, RowParallelLinear
 from paddlefleet.tensor_parallel.random import model_parallel_cuda_manual_seed
+from paddlefleet.transformer.activations import situ
 from paddlefleet.transformer.mlp import MLPSublayersSpec
 from paddlefleet.transformer.moe import MoELayer, MoESublayers
 import paddlefleet.transformer.moe.fused_a2a as fleet_fused_a2a
@@ -237,9 +238,11 @@ def main():
         moe_shared_expert_overlap=True,
         using_sonic_moe=USE_SONIC_MOE,
         hidden_act=F.silu,
-        # hidden_act="situ",
-        # situ_glu_fusion=True,
-        # situ_glu_plain_fusion=True,
+        # hidden_act=situ,
+        situ_glu_fusion=True,
+        situ_glu_plain_fusion=True,
+        activation_situ_beta=4.0,
+        activation_situ_linear_beta=25.0,
     )
 
     mlp_spec = MLPSublayersSpec(

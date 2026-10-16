@@ -666,7 +666,9 @@ class TeraMoENode:
             ks_cpu.append((n + FP8_ALIGN - 1) // FP8_ALIGN * FP8_ALIGN)
         async_load = AsyncLoad()
         self.ks_cpu = ks_cpu
-        self.grouped_layout = async_load(ks_cpu, dtype="int32")
+        t = async_load(ks_cpu + tokens_per_expert, dtype="int32")
+        self.grouped_layout = t[:len(ks_cpu)]
+        self.tokens_per_expert_gpu = t[len(ks_cpu):]
         self.m_indices = paddle.repeat_interleave(
             paddle.arange(len(tokens_per_expert), dtype="int32"), self.grouped_layout)
 
@@ -686,7 +688,7 @@ class TeraMoENode:
             recv_scale = None
 
         with paddle.amp.auto_cast(False):
-            x, rowmap, unzipped_probs, x_scale = paddle.nn.functional.moe_permute(
+            x, self.rowmap, unzipped_probs, x_scale = paddle.nn.functional.moe_permute(
                 recv_x, recv_scale, recv_token_indices, recv_token_probs,
                 padding_alignment=FP8_ALIGN, num_experts=E, tokens_per_expert=tokens_per_expert,
                 using_ue8m0_scale=True)
@@ -721,7 +723,7 @@ class TeraMoENode:
 
         with paddle.amp.auto_cast(False):
             zipped_out, _ = paddle.nn.functional.moe_unpermute(
-                o3, rowmap, recv_token_indices, unzipped_probs,
+                o3, self.rowmap, recv_token_indices, unzipped_probs,
                 total_zipped_tokens=len(recv_token_indices), num_experts=E)
         del o3
 
@@ -1127,31 +1129,27 @@ class TeraMoENode:
 
         ############################ GEMM BACKWARD #############################
 
-        do3, rowmap, _, _ = paddle.nn.functional.moe_permute(
-            self.recv_dout, None, self.recv_token_indices,
-            paddle.empty(self.recv_token_indices.shape, dtype="float32"),  # placeholder
-            padding_alignment=FP8_ALIGN, num_experts=E,
-            tokens_per_expert=self.tokens_per_expert)
+        do3, do3_fp8, do3_scale = deep_gemm.token_scatter(
+            self.recv_dout, self.rowmap, self.tokens_per_expert_gpu, len(self.o1), FP8_ALIGN,
+            quant=self.fp8 is not None)
+        assert self.fp8 or (do3_fp8 is None and do3_scale is None)
         del self.recv_dout
 
         if self.fp8:
-            do3_fp8, do3_scale = quant_input(do3, transpose_scale=True)
-
             do2 = paddle.empty([len(do3), I], dtype="bfloat16")
             deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
                 (do3_fp8, do3_scale.T), w_down_n, do2, self.m_indices)
 
-            do1, dprobs, o2 = paddlefleet_ops.fused_swiglu_probs_bwd(
-                self.o1, do2, self.unzipped_probs, inplace=True)
+            do1, dprobs, o2, do1_fp8, do1_scale = deep_gemm.weighted_swiglu_grad(
+                self.o1, self.unzipped_probs, do2, inplace=True)
             del self.o1, do2, self.unzipped_probs
+
+            bf16_weight_grad(o2, do3, w_down, self.ks_cpu, self.grouped_layout)
+            del o2, do3
 
             x_dequant = dequant_input(*self.x)
             bf16_weight_grad(x_dequant, do1, w_gateup, self.ks_cpu, self.grouped_layout)
-            bf16_weight_grad(o2, do3, w_down, self.ks_cpu, self.grouped_layout)
-            del self.x, x_dequant, o2, do3
-
-            do1_fp8, do1_scale = quant_input(do1, transpose_scale=True)
-            del do1
+            del self.x, x_dequant, do1
 
             dx = paddle.empty([len(do1_fp8), H], dtype="bfloat16")
             deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
@@ -1177,7 +1175,7 @@ class TeraMoENode:
         ########################## DISPATCH BACKWARD ###########################
 
         drecv_x, drecv_probs = paddle.nn.functional.moe_unpermute(
-            dx, rowmap, self.recv_token_indices, dprobs,
+            dx, self.rowmap, self.recv_token_indices, dprobs,
             total_zipped_tokens=len(self.recv_token_indices), num_experts=E)
         del dx, dprobs
 
