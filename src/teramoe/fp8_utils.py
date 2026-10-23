@@ -1,3 +1,4 @@
+import numpy as np
 from typing import Callable
 
 import paddle
@@ -234,6 +235,24 @@ def async_offload(x: Tensor) -> Tensor:
     return out
 
 
+def make_batch_task_queue(tokens_per_expert: list[int]) -> np.ndarray:
+    """Make a fine-grained task queue with chunk size 128 for batched launch."""
+    tokens_per_expert = np.array(tokens_per_expert, np.int32)
+    tasks_per_expert = (tokens_per_expert + FP8_ALIGN - 1) // FP8_ALIGN
+    task_queue = np.empty((tasks_per_expert.sum(), 4), np.int32)
+
+    # expert_id can be omitted
+    task_queue[:, 1] = np.arange(0, len(task_queue) * FP8_ALIGN, FP8_ALIGN, np.int32)
+    task_queue[:, 2] = FP8_ALIGN
+    task_queue[:, 3] = 1
+
+    last_task_per_expert = tasks_per_expert.cumsum() - 1
+    last_size_per_expert = tokens_per_expert % FP8_ALIGN
+    task_queue[last_task_per_expert, 2] = np.where(
+        last_size_per_expert, last_size_per_expert, FP8_ALIGN)
+    return task_queue
+
+
 def quant_input(x: Tensor, transpose_scale: bool = False) -> tuple[Tensor, Tensor]:
     """对于 hidden_states, 在 hidden 维上使用 128 分块量化."""
     x_fp8, scale = paddle.incubate.nn.functional.fp8_quant_blockwise(
@@ -244,7 +263,7 @@ def quant_input(x: Tensor, transpose_scale: bool = False) -> tuple[Tensor, Tenso
     )
     assert x_fp8.shape == x.shape
     scale_shape = [x.shape[0], x.shape[1] // QUANT_BLOCK_SIZE]
-    assert scale.shape == scale_shape[::-1] if transpose_scale else scale_shape
+    assert scale.shape == (scale_shape[::-1] if transpose_scale else scale_shape)
     assert x_fp8.is_contiguous()
     assert scale.is_contiguous()
     return x_fp8, scale
@@ -336,6 +355,7 @@ class TeraMoENode:
         chunk_size: int,
         num_calc_sms: int,
         combine_overlap_ratio: float,
+        activation: dict[str, int | float],
     ):
         self.buffer = buffer
         self.hidden_states = hidden_states
@@ -350,6 +370,7 @@ class TeraMoENode:
         self.chunk_size = chunk_size
         self.num_calc_sms = num_calc_sms
         self.combine_overlap_ratio = combine_overlap_ratio
+        self.activation = activation
         self.avg_tokens_per_card = token_indices.size  # seqlen * topk
         self.avg_num_tasks = int(self.avg_tokens_per_card / chunk_size + len(w_gateup) / 2)
 
@@ -447,7 +468,7 @@ class TeraMoENode:
             lambda task_idx: deep_gemm.bf16_chunk_gemm_nn(
                 unzipped_tokens, w_gateup, o1, task_queue, task_idx),
             lambda task_idx: deep_gemm.chunk_weighted_swiglu(
-                o1, unzipped_probs, o2, task_queue, task_idx, self.chunk_size, precise=True),
+                o1, unzipped_probs, o2, task_queue, task_idx, self.chunk_size, **self.activation),
             lambda task_idx: deep_gemm.bf16_chunk_gemm_nn(o2, w_down, o3, task_queue, task_idx),
             lambda task_idx: deep_gemm.chunk_zip(
                 o3, zipped_out, atomic_to_zip, zip_to_atomic, recv_token_indices, num_valid_topk,
@@ -555,7 +576,7 @@ class TeraMoENode:
                 unzipped_x, w_gateup_t, o1, task_queue, task_idx),
             lambda task_idx: deep_gemm.chunk_weighted_swiglu(
                 o1, unzipped_probs, o2_fp8, task_queue, task_idx, self.chunk_size,
-                o2_scales=o2_scale),
+                **self.activation, o2_scales=o2_scale),
             lambda task_idx: deep_gemm.fp8_chunk_gemm_nt(
                 (o2_fp8, o2_scale), w_down_t, o3, task_queue, task_idx),
             lambda task_idx: deep_gemm.chunk_zip(
@@ -600,10 +621,11 @@ class TeraMoENode:
         self.m_start_wgrad = m_start_wgrad
 
         async_load = AsyncLoad()
-        t = async_load(ks_cpu + m_start + m_start_wgrad, dtype="int32")
+        t = async_load(ks_cpu + m_start + m_start_wgrad + tokens_per_expert, dtype="int32")
         self.grouped_layout = t[:len(ks_cpu)]
-        self.m_start_gpu = t[len(ks_cpu):-len(m_start_wgrad)]
-        self.m_start_wgrad_gpu = t[-len(m_start_wgrad):]
+        self.m_start_gpu = t[len(ks_cpu) : len(ks_cpu) + len(m_start)]
+        self.m_start_wgrad_gpu = t[len(ks_cpu) + len(m_start) : len(ks_cpu) + len(m_start) * 2]
+        self.tokens_per_expert_gpu = t[len(ks_cpu) + len(m_start) * 2:]
 
         self.ordered_to_zip = paddle.empty([m_start_wgrad[-1]], dtype="int32")
         ordered_to_atomic = paddle.empty_like(self.ordered_to_zip) if not self.fp8_wgrad else None
@@ -613,14 +635,11 @@ class TeraMoENode:
         # 提前为 bf16_wgrad 恢复顺序
         if not self.fp8_wgrad:
             self.ordered_to_atomic = ordered_to_atomic
-            self.unzipped_probs = deep_gemm.token_gather(
-                self.unzipped_probs.unsqueeze(-1), ordered_to_atomic)
+            self.unzipped_probs = self.unzipped_probs.gather(ordered_to_atomic)
             self.recv_token_indices = self.recv_token_indices.cast("int32")
 
     def _forward_intranode(self):
         """Simple fallback for intranode."""
-        import paddlefleet_ops
-
         ########################### DISPATCH FORWARD ###########################
 
         hidden_states = quant_input(self.hidden_states) if self.fp8 else self.hidden_states
@@ -672,6 +691,9 @@ class TeraMoENode:
         self.m_indices = paddle.repeat_interleave(
             paddle.arange(len(tokens_per_expert), dtype="int32"), self.grouped_layout)
 
+        task_queue_np = make_batch_task_queue(tokens_per_expert)
+        async_load.wait()
+
         event.current_stream_wait()
         del hidden_states
         self.recv_x = recv_x
@@ -701,19 +723,25 @@ class TeraMoENode:
                 (x, x_scale.T.contiguous().T), w_gateup_t, o1, self.m_indices)
             del x, x_scale
 
-            o2_fp8, o2_scale = paddlefleet_ops.fuse_weighted_swiglu_fp8_quant(
-                o1, unzipped_probs, using_pow2_scaling=True, use_ue8m0=True)
+            o2_fp8 = paddle.empty([num_unzipped_tokens, I], dtype="float8_e4m3fn")
+            o2_scale = paddle.empty([I // QUANT_BLOCK_SIZE, num_unzipped_tokens], dtype="int32").T
+            deep_gemm.chunk_weighted_swiglu(
+                o1, unzipped_probs, o2_fp8, async_load(task_queue_np), task_idx=-1,
+                chunk_size=FP8_ALIGN, **self.activation, o2_scales=o2_scale)
 
             o3 = paddle.empty([num_unzipped_tokens, H], dtype="bfloat16")
             deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
-                (o2_fp8, o2_scale.T.contiguous().T), w_down_t, o3, self.m_indices)
+                (o2_fp8, o2_scale), w_down_t, o3, self.m_indices)
             del o2_fp8, o2_scale
         else:
             o1 = paddle.empty([num_unzipped_tokens, 2 * I], dtype="bfloat16")
             deep_gemm.m_grouped_bf16_gemm_nn_contiguous(x, w_gateup, o1, self.m_indices)
             del x
 
-            o2 = paddlefleet_ops.fused_swiglu_scale(o1, unzipped_probs)
+            o2 = paddle.empty([num_unzipped_tokens, I], dtype="bfloat16")
+            deep_gemm.chunk_weighted_swiglu(
+                o1, unzipped_probs, o2, async_load(task_queue_np), task_idx=-1,
+                chunk_size=FP8_ALIGN, **self.activation)
 
             o3 = paddle.empty([num_unzipped_tokens, H], dtype="bfloat16")
             deep_gemm.m_grouped_bf16_gemm_nn_contiguous(o2, w_down, o3, self.m_indices)
@@ -811,7 +839,7 @@ class TeraMoENode:
             lambda task_idx: deep_gemm.chunk_weighted_swiglu_grad(
                 self.o1, self.unzipped_probs, do2, o2_bwd, do1, drecv_probs,
                 atomic_to_zip_bwd, self.zip_to_atomic, recv_token_indices, task_queue, task_idx,
-                self.chunk_size, precise=True),
+                self.chunk_size, **self.activation),
             lambda task_idx: deep_gemm.bf16_chunk_gemm_nt(do1, w_gateup, dx, task_queue, task_idx),
             lambda task_idx: deep_gemm.chunk_zip(
                 dx, drecv_x, atomic_to_zip_bwd, zip_to_atomic_bwd, recv_token_indices,
@@ -950,7 +978,8 @@ class TeraMoENode:
             lambda task_idx: deep_gemm.chunk_weighted_swiglu_grad(
                 self.o1, self.unzipped_probs, do2, o2_bwd_fp8, do1_fp8, drecv_probs,
                 atomic_to_zip_bwd, self.zip_to_atomic, recv_token_indices, task_queue, task_idx,
-                self.chunk_size, o2_bwd_scales=o2_bwd_scale, do1_scales=do1_scale),
+                self.chunk_size, **self.activation,
+                o2_bwd_scales=o2_bwd_scale, do1_scales=do1_scale),
             lambda task_idx: deep_gemm.fp8_chunk_gemm_nt(
                 do1, w_gateup_n, dx, task_queue, task_idx),
             lambda task_idx: deep_gemm.chunk_zip(
@@ -1021,8 +1050,6 @@ class TeraMoENode:
         )
 
     def _backward_fp8_bf16_wgrad_wait(self):
-        import paddlefleet_ops
-
         w_gateup, w_down = self.w_gateup, self.w_down
         H, I = w_gateup.shape[1], w_down.shape[1]
         w_gateup_n = get_quant_weight(w_gateup)
@@ -1037,12 +1064,10 @@ class TeraMoENode:
 
         deep_gemm.set_num_sms(0)
 
-        # NOTES: paddle unzip 性能较差, 这里用重复读的 gather 性能都比它好, 而且实际运行时大部分 token
-        #        都只有一个专家, 重复读影响很小; 前面用 paddle 只是为了构造 rowmap 给后面的 zip 用
-        # NOTES: 先 unzip 再 quant, 因为 paddle quant 算子在非对齐情况性能较差
-        do3 = deep_gemm.token_gather(self.recv_dout, self.ordered_to_zip)
+        do3, do3_fp8, do3_scale = deep_gemm.token_scatter(
+            self.recv_dout, self.rowmap, self.tokens_per_expert_gpu, len(self.o1), FP8_ALIGN,
+            quant=True)
         del self.recv_dout
-        do3_fp8, do3_scale = quant_input(do3, transpose_scale=True)
 
         ########## DOWN_GRAD ###########
 
@@ -1057,11 +1082,9 @@ class TeraMoENode:
 
         ######### SWIGLU_GRAD ##########
 
-        do1, dprobs, o2 = paddlefleet_ops.fused_swiglu_probs_bwd(
-            self.o1, do2, self.unzipped_probs, inplace=True)
+        do1, dprobs, o2, do1_fp8, do1_scale = deep_gemm.weighted_swiglu_grad(
+            self.o1, self.unzipped_probs, do2, **self.activation, inplace=True, quant=True)
         del self.o1, do2, self.unzipped_probs
-
-        do1_fp8, do1_scale = quant_input(do1, transpose_scale=True)
 
         ######### GATEUP_GRAD ##########
 
@@ -1116,8 +1139,6 @@ class TeraMoENode:
         self.dispatch_done_event = event
 
     def _backward_intranode_wait(self):
-        import paddlefleet_ops
-
         w_gateup, w_down = self.w_gateup, self.w_down
         E, I, H = w_down.shape
         if self.fp8:
@@ -1141,7 +1162,7 @@ class TeraMoENode:
                 (do3_fp8, do3_scale.T), w_down_n, do2, self.m_indices)
 
             do1, dprobs, o2, do1_fp8, do1_scale = deep_gemm.weighted_swiglu_grad(
-                self.o1, self.unzipped_probs, do2, inplace=True)
+                self.o1, self.unzipped_probs, do2, **self.activation, inplace=True, quant=True)
             del self.o1, do2, self.unzipped_probs
 
             bf16_weight_grad(o2, do3, w_down, self.ks_cpu, self.grouped_layout)
@@ -1159,10 +1180,9 @@ class TeraMoENode:
             do2 = paddle.empty([len(do3), I], dtype="bfloat16")
             deep_gemm.m_grouped_bf16_gemm_nt_contiguous(do3, w_down, do2, self.m_indices)
 
-            do1, dprobs = paddlefleet_ops.fused_swiglu_scale_bwd(self.o1, self.unzipped_probs, do2)
-            del do2
-            o2 = paddlefleet_ops.fused_swiglu_scale(self.o1, self.unzipped_probs)
-            del self.o1, self.unzipped_probs
+            do1, dprobs, o2, _, _ = deep_gemm.weighted_swiglu_grad(
+                self.o1, self.unzipped_probs, do2, **self.activation, inplace=True)
+            del self.o1, do2, self.unzipped_probs
 
             bf16_weight_grad(self.x, do1, w_gateup, self.ks_cpu, self.grouped_layout)
             bf16_weight_grad(o2, do3, w_down, self.ks_cpu, self.grouped_layout)

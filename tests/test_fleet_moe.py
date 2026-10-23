@@ -33,6 +33,7 @@ NUM_COMM_SMS = 52
 USE_FP8 = False
 USE_FP8_WGRAD = False
 USE_SONIC_MOE = False
+USE_SITU = False
 LONG_RUN = 0
 
 
@@ -85,6 +86,8 @@ class TeraMoELayer(MoELayer):
             self.num_experts,
             self.moe_group,
             combine_overlap_handle,
+            self,
+            self._activation_type,
             fp8=self.config.fp8,
             fp8_wgrad=USE_FP8_WGRAD,
             use_ue8m0=self.config.use_ue8m0,
@@ -202,7 +205,8 @@ def check(fleet_out, teramoe_out):
         avg, max = float(diff.mean()), float(diff.max())
         if max == 0:
             print(f"{name}: 0.0")
-        elif ref.dtype == paddle.float32 and USE_FP8 and USE_FP8_WGRAD:
+        elif ((USE_FP8 and USE_FP8_WGRAD and name.startswith("w")) or
+              (USE_SITU and name == "hs_grad")):
             # wgrad 的绝对误差比较大，只能比较 cos 相似性
             cos = float(F.cosine_similarity(ref.flatten(), tgt.flatten(), axis=0, eps=0))
             print(f"{name}: avg={avg:e} max={max:e} cos={cos:.6f}")
@@ -237,8 +241,8 @@ def main():
         moe_expert_fusion=True,
         moe_shared_expert_overlap=True,
         using_sonic_moe=USE_SONIC_MOE,
-        hidden_act=F.silu,
-        # hidden_act=situ,
+        hidden_act=situ if USE_SITU else F.silu,
+        # activation_func_clamp_value=1.0,
         situ_glu_fusion=True,
         situ_glu_plain_fusion=True,
         activation_situ_beta=4.0,
@@ -333,6 +337,7 @@ if __name__ == "__main__":
     parser.add_argument("--fp8", action="store_true", help="Use fp8")
     parser.add_argument("--fp8-wgrad", action="store_true", help="Use fp8 wgrad")
     parser.add_argument("--sonic-moe", action="store_true", help="Use sonic moe for baseline")
+    parser.add_argument("--situ", action="store_true", help="Use situ")
     parser.add_argument("--long-run", type=int, default=0, help="Specify long-run steps")
     parser.add_argument("args", nargs="*", help="Unused args")
     args = parser.parse_args()
@@ -340,6 +345,7 @@ if __name__ == "__main__":
     USE_FP8 = args.fp8
     USE_FP8_WGRAD = args.fp8_wgrad
     USE_SONIC_MOE = args.sonic_moe
+    USE_SITU = args.situ
     LONG_RUN = args.long_run
 
     # 不使用 sonicmoe 时, 可以去掉 barrier_ep; sonicmoe 则因为 jit 太慢了不能去掉

@@ -95,8 +95,7 @@ def forward_autograd(
     group: Group,
     combine_overlap_handle: _CombineOverlapHandle | None = None,
     custom_map: Any = None,
-    hidden_act: Literal["silu"] = "silu",
-    activation_type: Literal["swiglu"] | None = None,
+    activation_type: Literal["swiglu", "situ"] = "swiglu",
     fp8: Literal["e4m3"] | None = None,
     fp8_wgrad: bool = True,
     use_ue8m0: bool = True,
@@ -116,8 +115,7 @@ def forward_autograd(
         group (Group): The EP communication group.
         combine_overlap_handle (_CombineOverlapHandle, optional): Shared expert handle to overlap with combine. Default is None.
         custom_map (MoELayer): Custom mapping for extra configs.
-        hidden_act (str, optional): Activation function for non-linearity in MLP.
-        activation_type (str, optional): Alias for hidden_act, but uses different names. Default is None.
+        activation_type (str, optional): Activation function for non-linearity in MLP. Default is swiglu.
         fp8 (str, optional): The fp8 data type. Default is None, which uses bf16.
         fp8_wgrad (bool, optional): Whether to use fp8 in weight grad. Default is True.
         use_ue8m0 (bool, optional): Whether to use ue8m0 scale. Default is True.
@@ -126,10 +124,8 @@ def forward_autograd(
         combine_overlap_ratio (float, optional): Ratio of tasks to overlap with combine.
     """
     # Check params
-    if activation_type is None:
-        assert hidden_act == "silu", f"Only supports silu activation, got {hidden_act}."
-    else:
-        assert activation_type == "swiglu", f"Only supports swiglu activation, got {activation_type}."
+    assert activation_type in ("swiglu", "situ"), (
+        f"Only supports swiglu and situ activation, got {activation_type}.")
     assert fp8 is None or fp8 == "e4m3", f"Only supports fp8 e4m3, got {fp8}."
     assert fp8 is None or use_ue8m0, f"Only supports ue8m0 scale."
     assert isinstance(chunk_size, int) and chunk_size > 0 and chunk_size % FP8_ALIGN == 0, (
@@ -159,6 +155,22 @@ def forward_autograd(
         f"while H={w_gateup.shape[1]}.")
     assert hidden_states.is_contiguous(), "Requires hidden_states be contiguous."
 
+    # Get extra configs from custom_map
+    config = getattr(custom_map, "config", None)
+    if activation_type == "swiglu":
+        clamp_value = getattr(config, "activation_func_clamp_value", None)
+        if clamp_value is None:
+            activation = {"activation": 0}
+        else:
+            activation = {"activation": 1, "arg0": clamp_value}
+    else:
+        situ_beta = getattr(config, "activation_situ_beta", 1.0)
+        situ_linear_beta = getattr(config, "activation_situ_linear_beta", None)
+        if situ_linear_beta is None:
+            activation = {"activation": 2, "arg0": situ_beta}
+        else:
+            activation = {"activation": 3, "arg0": situ_beta, "arg1": situ_linear_beta}
+
     buffer = get_buffer(group, get_hidden_bytes(hidden_states))
     hs_2d = hidden_states.view([-1, hidden_states.shape[-1]])
 
@@ -169,7 +181,7 @@ def forward_autograd(
     #    其反向恰好在 post 与 pre 之间执行, 从而也能控制它与 combine 进行 overlap
     node = TeraMoENode(
         buffer, hs_2d, topk_weights, topk_indices, w_gateup, w_down, group, num_experts,
-        fp8, fp8_wgrad, chunk_size, num_calc_sms, combine_overlap_ratio)
+        fp8, fp8_wgrad, chunk_size, num_calc_sms, combine_overlap_ratio, activation)
 
     fn_args, fn_out = (), ()
     if combine_overlap_handle is not None:
