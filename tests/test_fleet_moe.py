@@ -22,6 +22,8 @@ assert paddlefleet.__path__[0] == os.path.join(FLEET_PATH, "paddlefleet"), (
 from paddlefleet.process_groups_config import ProcessGroupCollection
 from paddlefleet.tensor_parallel import ColumnParallelLinear, RowParallelLinear
 from paddlefleet.tensor_parallel.random import model_parallel_cuda_manual_seed
+from paddlefleet.trainer.plugins.timer import Timers
+from paddlefleet.training.global_vars import set_profile_timers
 from paddlefleet.transformer.activations import situ
 from paddlefleet.transformer.mlp import MLPSublayersSpec
 from paddlefleet.transformer.moe import MoELayer, MoESublayers
@@ -101,8 +103,8 @@ class TeraMoELayer(MoELayer):
         return hidden_states
 
 
-def run_layer(moe_layer, hidden_states, out_grad, profile=None):
-    # 如果在 moe_router.py 里给 bias 加了随机不均衡, 每次 run 使用相同的随机顺序
+def run_layer(moe_layer, hidden_states, out_grad, profile=None, timers=None):
+    # 如果在 moe_router.py 里给 bias 加了随机不均衡, 每次 run 需要使用相同的随机顺序
     paddle.cuda.manual_seed(0)
 
     if USE_FP8:
@@ -136,6 +138,10 @@ def run_layer(moe_layer, hidden_states, out_grad, profile=None):
 
     if profile is None:
         return out, hidden_states.grad, *weight_grads
+
+    if timers is not None:
+        for timer in timers.timers.values():
+            timer.reset()
 
     if LONG_RUN:
         print("LONG_RUN", profile, "-" * 80)
@@ -303,6 +309,10 @@ def main():
 
     ################################# PROFILE ##################################
 
+    timers = Timers()
+    set_profile_timers(timers)
+    timer_names = ["dispatch", "fusion_mlp", "combine"]
+
     paddle.base.core.nvprof_start()
 
     # fleet
@@ -311,8 +321,9 @@ def main():
     moe_layer.set_state_dict(state_dict)
 
     for i in range(2):
-        run_layer(moe_layer, hidden_states, out_grad, profile="fleet")
+        run_layer(moe_layer, hidden_states, out_grad, profile="fleet", timers=timers)
 
+    print(timers.log(timer_names, LONG_RUN or 10))
     fleet_fused_a2a._buffer = None
     dist.barrier()
 
@@ -321,8 +332,9 @@ def main():
     moe_layer = paddle.amp.decorate(moe_layer, level="O2", dtype="bfloat16")
     moe_layer.set_state_dict(state_dict)
 
-    run_layer(moe_layer, hidden_states, out_grad, profile="teramoe")
+    run_layer(moe_layer, hidden_states, out_grad, profile="teramoe", timers=timers)
 
+    print(timers.log(timer_names, LONG_RUN or 10))
     dist.barrier()
     paddle.base.core.nvprof_stop()
 

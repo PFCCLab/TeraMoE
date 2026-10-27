@@ -6,7 +6,8 @@ import paddle.distributed as dist
 from paddle import Tensor
 from paddle.distributed.communication.group import Group
 
-from teramoe import deep_ep, deep_gemm
+from . import deep_ep, deep_gemm
+from .async_utils import AsyncLoad, async_offload, get_profile_timers, started
 
 FP8_ALIGN = 128
 QUANT_BLOCK_SIZE = 512
@@ -147,7 +148,7 @@ class GroupedTaskLauncher:
         end = max(int(self._num_tasks - num_overlap_tasks), begin)  # excluded
 
         if begin < end:
-            paddle.base.core.nvprof_nvtx_push(f"B{begin}_{end - 1}")
+            paddle.base.core.nvprof_nvtx_push(f"Bx{end - begin}")
             self._grouped_launch(begin, end)
             paddle.base.core.nvprof_nvtx_pop()
 
@@ -166,73 +167,6 @@ class GroupedTaskLauncher:
     def __del__(self):
         assert self._next_task_idx == self._num_tasks, (
             f"tasks not correctly launched: next={self._next_task_idx} total={self._num_tasks}")
-
-
-class AsyncLoad:
-    def __init__(self):
-        self._pin = None
-        self._event = None
-
-    def __call__(self, x, dtype=None) -> paddle.Tensor:
-        """Copy x to GPU asynchronously."""
-        assert self._pin is None, (
-            "The previous copy is not finished, call wait() first before reuse for another copy.")
-
-        cudart = paddle.cuda.cudart()
-        self._pin = paddle.to_tensor(x, dtype=dtype, place=paddle.CUDAPinnedPlace())
-
-        out = paddle.empty_like(self._pin)
-        stream = paddle.cuda.current_stream()
-
-        err = cudart.cudaMemcpyAsync(
-            out.data_ptr(),
-            self._pin.data_ptr(),
-            out.size * out.itemsize,
-            cudart.cudaMemcpyHostToDevice,
-            stream.stream_base.cuda_stream,
-        )
-        assert err == cudart.cudaError.success, f"cudaMemcpyAsync failed: {err}"
-
-        # the pinned tensor cannot be freed before the copy event is done
-        if self._event is None:
-            self._event = paddle.cuda.Event()
-        self._event.record()
-
-        return out
-
-    def wait(self):
-        """Wait the current copy to finish and free the pinned tensor."""
-        if self._pin is not None:
-            self._event.synchronize()
-            self._pin = None
-
-    def __del__(self):
-        self.wait()
-
-
-def async_offload(x: Tensor) -> Tensor:
-    """Copy x to pin_memory asynchronously."""
-    assert x.dtype == paddle.int32 and x.place.is_gpu_place()
-
-    pin = paddle.core.DenseTensor()
-    pin._set_dims(x.shape)
-    pin._alloc_int(paddle.CUDAPinnedPlace())
-
-    cudart = paddle.cuda.cudart()
-    stream = paddle.cuda.current_stream()
-
-    err = cudart.cudaMemcpyAsync(
-        pin._ptr(),
-        x.data_ptr(),
-        x.size * x.itemsize,
-        cudart.cudaMemcpyDeviceToHost,
-        stream.stream_base.cuda_stream,
-    )
-    assert err == cudart.cudaError.success, f"cudaMemcpyAsync failed: {err}"
-
-    out = paddle.Tensor()
-    out.get_tensor()._share_data_nocheck_with(pin)
-    return out
 
 
 def make_batch_task_queue(tokens_per_expert: list[int]) -> np.ndarray:
@@ -373,6 +307,11 @@ class TeraMoENode:
         self.activation = activation
         self.avg_tokens_per_card = token_indices.size  # seqlen * topk
         self.avg_num_tasks = int(self.avg_tokens_per_card / chunk_size + len(w_gateup) / 2)
+        self.enable_overlap = self.buffer.runtime.get_num_rdma_ranks() > 1
+        timers = get_profile_timers()
+        self.dispatch_timer = timers("dispatch", use_event=True)
+        self.compute_timer = timers("fusion_mlp", use_event=True)
+        self.combine_timer = timers("combine", use_event=True)
 
     def _reduce_max_tokens_per_card(self, num_tokens_per_expert: Tensor):
         """归约当前 ep_group 内每个 rank 的展开 token 数的最大值, 用于统计均衡度.
@@ -394,13 +333,14 @@ class TeraMoENode:
         and the output is hold util the user calls forward_wait.
         """
         paddle.base.core.nvprof_nvtx_push("teramoe_forward")
-        if self.buffer.runtime.get_num_rdma_ranks() > 1:
+        self.dispatch_timer.start()
+        if self.enable_overlap:
             if self.fp8:
                 self._forward_fp8()
             else:
                 self._forward_bf16()
         else:
-            self._forward_intranode()
+            self._forward_serial()
         paddle.base.core.nvprof_nvtx_pop()
 
     def _forward_bf16(self):
@@ -480,9 +420,11 @@ class TeraMoENode:
 
         deep_gemm.set_num_sms(self.num_calc_sms)
         task_launcher.run_dispatch_overlap()
+        self.dispatch_timer.stop()
 
         deep_gemm.set_num_sms(0)
-        task_launcher.run_compute()
+        with started(self.compute_timer):
+            task_launcher.run_compute()
 
         ############################# COMBINE FORWARD ##############################
 
@@ -491,6 +433,7 @@ class TeraMoENode:
             zip_done=zip_done)
 
         deep_gemm.set_num_sms(self.num_calc_sms)
+        self.combine_timer.start()
         task_launcher.run_combine_overlap()
 
         self.o1 = o1
@@ -589,9 +532,11 @@ class TeraMoENode:
 
         deep_gemm.set_num_sms(self.num_calc_sms)
         task_launcher.run_dispatch_overlap()
+        self.dispatch_timer.stop()
 
         deep_gemm.set_num_sms(0)
-        task_launcher.run_compute()
+        with started(self.compute_timer):
+            task_launcher.run_compute()
 
         ########################### COMBINE FORWARD ############################
 
@@ -600,6 +545,7 @@ class TeraMoENode:
             zip_done=zip_done)
 
         deep_gemm.set_num_sms(self.num_calc_sms)
+        self.combine_timer.start()
         task_launcher.run_combine_overlap()
 
         self.o1 = o1
@@ -638,7 +584,7 @@ class TeraMoENode:
             self.unzipped_probs = self.unzipped_probs.gather(ordered_to_atomic)
             self.recv_token_indices = self.recv_token_indices.cast("int32")
 
-    def _forward_intranode(self):
+    def _forward_serial(self):
         """Simple fallback for intranode."""
         ########################### DISPATCH FORWARD ###########################
 
@@ -695,6 +641,9 @@ class TeraMoENode:
         async_load.wait()
 
         event.current_stream_wait()
+        self.dispatch_timer.stop()
+        self.compute_timer.start()
+
         del hidden_states
         self.recv_x = recv_x
         recv_token_indices = recv_token_indices.cast("int32")
@@ -755,6 +704,8 @@ class TeraMoENode:
                 total_zipped_tokens=len(recv_token_indices), num_experts=E)
         del o3
 
+        self.compute_timer.stop()
+        self.combine_timer.start()
         notify_done_event = deep_ep.Buffer.capture()
 
         out, _, event = self.buffer.combine(
@@ -773,6 +724,7 @@ class TeraMoENode:
         """Wait for combine to finish and return the combined result."""
         out = self.out
         self.combine_done_event.current_stream_wait()
+        self.combine_timer.stop()
         self.tokens_per_card_max_mean_ratio = (
             self.max_tokens_per_card.item() / self.avg_tokens_per_card)
         del self.out, self.combine_done_event, self.max_tokens_per_card
@@ -784,7 +736,7 @@ class TeraMoENode:
         This function accepts one input, and has no output in the same way as forward.
         """
         paddle.base.core.nvprof_nvtx_push("teramoe_backward")
-        if self.buffer.runtime.get_num_rdma_ranks() > 1:
+        if self.enable_overlap:
             if self.fp8:
                 if self.fp8_wgrad:
                     self._backward_fp8(dout)
@@ -793,7 +745,7 @@ class TeraMoENode:
             else:
                 self._backward_bf16(dout)
         else:
-            self._backward_intranode(dout)
+            self._backward_serial(dout)
         # nvtx pop on wait
 
     def _backward_bf16(self, dout: Tensor):
@@ -1086,6 +1038,9 @@ class TeraMoENode:
             self.o1, self.unzipped_probs, do2, **self.activation, inplace=True, quant=True)
         del self.o1, do2, self.unzipped_probs
 
+        bf16_weight_grad(self.x, do1, w_gateup, self.ks_cpu, self.grouped_layout)
+        bf16_weight_grad(o2, do3, w_down, self.ks_cpu, self.grouped_layout)
+
         ######### GATEUP_GRAD ##########
 
         dx = paddle.empty([num_unzipped_tokens, H], dtype="bfloat16")
@@ -1111,50 +1066,39 @@ class TeraMoENode:
         paddle.base.core.nvprof_nvtx_push("wgrad")
         deep_gemm.set_num_sms(self.num_calc_sms)
 
-        bf16_weight_grad(self.x, do1, w_gateup, self.ks_cpu, self.grouped_layout)
-        bf16_weight_grad(o2, do3, w_down, self.ks_cpu, self.grouped_layout)
-
         paddle.base.core.nvprof_nvtx_pop()
 
-    def _backward_intranode(self, dout: Tensor):
+    def _backward_serial(self, dout: Tensor):
         ########################### COMBINE BACKWARD ###########################
 
         recv_dout, _, _, _, _, event = self.buffer.dispatch(
             dout, handle=self.handle, async_finish=True, allocate_on_comm_stream=False)
 
-        recv_x, recv_scale = self.recv_x, None
-        if self.fp8:
-            recv_x, recv_scale = recv_x
-        del self.recv_x
-
-        # 先 unzip 再 dequant, 与 baseline 保持一致
-        x, _, _, scale = paddle.nn.functional.moe_permute(
-            recv_x, recv_scale, self.recv_token_indices,
-            paddle.empty(self.recv_token_indices.shape, dtype="float32"),  # placeholder
-            padding_alignment=FP8_ALIGN, num_experts=len(self.w_gateup),
-            tokens_per_expert=self.tokens_per_expert, using_ue8m0_scale=True)
-
-        self.x = (x, scale) if self.fp8 else x
-        self.recv_dout = recv_dout
-        self.dispatch_done_event = event
-
-    def _backward_intranode_wait(self):
         w_gateup, w_down = self.w_gateup, self.w_down
         E, I, H = w_down.shape
         if self.fp8:
             w_gateup_n = get_quant_weight(w_gateup)
             w_down_n = get_quant_weight(w_down)
 
-        self.dispatch_done_event.current_stream_wait()
-        del self.dispatch_done_event
+        # 先 unzip 再 dequant, 与 baseline 保持一致
+        x, _, _, scale = paddle.nn.functional.moe_permute(
+            self.recv_x[0] if self.fp8 else self.recv_x,  # recv_x
+            self.recv_x[1] if self.fp8 else None,  # recv_scale
+            self.recv_token_indices,
+            paddle.empty(self.recv_token_indices.shape, dtype="float32"),  # placeholder
+            padding_alignment=FP8_ALIGN, num_experts=len(w_gateup),
+            tokens_per_expert=self.tokens_per_expert, using_ue8m0_scale=True)
+        del self.recv_x
+
+        event.current_stream_wait()
 
         ############################ GEMM BACKWARD #############################
 
         do3, do3_fp8, do3_scale = deep_gemm.token_scatter(
-            self.recv_dout, self.rowmap, self.tokens_per_expert_gpu, len(self.o1), FP8_ALIGN,
+            recv_dout, self.rowmap, self.tokens_per_expert_gpu, len(self.o1), FP8_ALIGN,
             quant=self.fp8 is not None)
         assert self.fp8 or (do3_fp8 is None and do3_scale is None)
-        del self.recv_dout
+        del recv_dout
 
         if self.fp8:
             do2 = paddle.empty([len(do3), I], dtype="bfloat16")
@@ -1168,9 +1112,10 @@ class TeraMoENode:
             bf16_weight_grad(o2, do3, w_down, self.ks_cpu, self.grouped_layout)
             del o2, do3
 
-            x_dequant = dequant_input(*self.x)
+            x_dequant = dequant_input(x, scale)
+            del x, scale
             bf16_weight_grad(x_dequant, do1, w_gateup, self.ks_cpu, self.grouped_layout)
-            del self.x, x_dequant, do1
+            del x_dequant, do1
 
             dx = paddle.empty([len(do1_fp8), H], dtype="bfloat16")
             deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
@@ -1184,9 +1129,9 @@ class TeraMoENode:
                 self.o1, self.unzipped_probs, do2, **self.activation, inplace=True)
             del self.o1, do2, self.unzipped_probs
 
-            bf16_weight_grad(self.x, do1, w_gateup, self.ks_cpu, self.grouped_layout)
+            bf16_weight_grad(x, do1, w_gateup, self.ks_cpu, self.grouped_layout)
             bf16_weight_grad(o2, do3, w_down, self.ks_cpu, self.grouped_layout)
-            del self.x, o2, do3
+            del x, o2, do3
 
             dx = paddle.empty([len(do1), I], dtype="bfloat16")
             deep_gemm.m_grouped_bf16_gemm_nt_contiguous(do1, w_gateup, dx, self.m_indices)
@@ -1207,11 +1152,9 @@ class TeraMoENode:
 
     def backward_wait(self) -> [Tensor, Tensor]:
         """Wait for combine to finish and return the combined result."""
-        if self.buffer.runtime.get_num_rdma_ranks() > 1:
+        if self.enable_overlap:
             if self.fp8 and not self.fp8_wgrad:
                 self._backward_fp8_bf16_wgrad_wait()
-        else:
-            self._backward_intranode_wait()
         paddle.base.core.nvprof_nvtx_pop()
 
         input_grads = self.input_grads
