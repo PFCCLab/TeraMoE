@@ -1,4 +1,6 @@
+import os
 import numpy as np
+from contextlib import contextmanager
 from typing import Callable
 
 import paddle
@@ -242,7 +244,7 @@ def quant_weight(w: Tensor, transpose: bool = False) -> tuple[Tensor, Tensor]:
 def get_quant_weight(w: Tensor, transpose: bool = False) -> tuple[Tensor, Tensor]:
     """从预处理的 fp8_cache 中获取 weight 的量化结果, 若不存在则现场量化."""
     if transpose:
-        if hasattr(w, "fp8_weight_stacked_transpose"):
+        if getattr(w, "fp8_weight_stacked_transpose", None) is not None:
             w_fp8, scale = w.fp8_weight_stacked_transpose, w.fp8_scale_stacked_transpose
             assert w_fp8.shape[-1] == w.shape[1]
             assert scale.shape[-1] == w.shape[1] // QUANT_BLOCK_SIZE
@@ -271,6 +273,16 @@ def dequant_input(x: Tensor, scale: Tensor) -> Tensor:
     if len(x) == 0:
         return paddle.empty(x.shape, dtype="bfloat16")
     return paddle.incubate.nn.functional.fused_act_dequant(x, scale)
+
+
+@contextmanager
+def cached_notify_guard() -> deep_ep.EventOverlap:
+    """Make the calc_stream after this guard wait for notify_dispatch to finish."""
+    event = deep_ep.Buffer.capture()
+    try:
+        yield event
+    finally:
+        event.current_stream_wait()
 
 
 class TeraMoENode:
@@ -318,13 +330,16 @@ class TeraMoENode:
 
         NOTES:
             1. 通信量为 ep_size 个 int, 成本极低;
-            2. 同时起到了 barrier_ep 的作用;
+            2. 同时起到了 barrier_ep 的作用, 可选 sync 或 async;
             3. offload 结果由 notify_dispatch 天然同步, 需要在调用完 dispatch 后才能使用.
         """
         global_num_tokens_per_card = num_tokens_per_expert.reshape(
             [self.group.nranks, -1]).sum(axis=1, dtype="int32")
         dist.all_reduce(global_num_tokens_per_card, group=self.group)
-        self.max_tokens_per_card = async_offload(global_num_tokens_per_card.max())
+        value = global_num_tokens_per_card.max()
+        flag = os.getenv("FLEET_MOE_EP_BARRIER_ASYNC")
+        is_async = flag is None or paddle.utils.strtobool(flag)
+        self.max_tokens_per_card = async_offload(value) if is_async else value.pin_memory()
 
     def forward(self):
         """Forward dispatch, compute and combine.
@@ -359,7 +374,7 @@ class TeraMoENode:
             allocate_on_comm_stream=False,
         )
 
-        max_tokens_per_card = self._reduce_max_tokens_per_card(num_tokens_per_expert)
+        self._reduce_max_tokens_per_card(num_tokens_per_expert)
 
         self.dispatch_layout = {
             "num_tokens_per_rank": num_tokens_per_rank,
@@ -459,7 +474,7 @@ class TeraMoENode:
             allocate_on_comm_stream=False,
         )
 
-        max_tokens_per_card = self._reduce_max_tokens_per_card(num_tokens_per_expert)
+        self._reduce_max_tokens_per_card(num_tokens_per_expert)
 
         self.dispatch_layout = {
             "num_tokens_per_rank": num_tokens_per_rank,
@@ -540,13 +555,14 @@ class TeraMoENode:
 
         ########################### COMBINE FORWARD ############################
 
-        out, _, event = self.buffer.combine(
-            zipped_out, handle, async_finish=True, allocate_on_comm_stream=False,
-            zip_done=zip_done)
+        with cached_notify_guard() as event:
+            out, _, event = self.buffer.combine(
+                zipped_out, handle, async_finish=True, previous_event=event,
+                allocate_on_comm_stream=False, zip_done=zip_done)
 
-        deep_gemm.set_num_sms(self.num_calc_sms)
-        self.combine_timer.start()
-        task_launcher.run_combine_overlap()
+            deep_gemm.set_num_sms(self.num_calc_sms)
+            self.combine_timer.start()
+            task_launcher.run_combine_overlap()
 
         self.o1 = o1
         self.out = out
@@ -580,8 +596,9 @@ class TeraMoENode:
 
         # 提前为 bf16_wgrad 恢复顺序
         if not self.fp8_wgrad:
-            self.ordered_to_atomic = ordered_to_atomic
-            self.unzipped_probs = self.unzipped_probs.gather(ordered_to_atomic)
+            self.o1 = deep_gemm.token_gather(self.o1, ordered_to_atomic)
+            self.unzipped_probs = deep_gemm.token_gather(
+                self.unzipped_probs.unsqueeze(1), ordered_to_atomic).squeeze(1)
             self.recv_token_indices = self.recv_token_indices.cast("int32")
 
     def _forward_serial(self):
@@ -604,7 +621,7 @@ class TeraMoENode:
             allocate_on_comm_stream=False,
         )
 
-        max_tokens_per_card = self._reduce_max_tokens_per_card(num_tokens_per_expert)
+        self._reduce_max_tokens_per_card(num_tokens_per_expert)
 
         (
             recv_x, recv_token_indices, recv_token_probs, tokens_per_expert, handle, event
@@ -706,14 +723,11 @@ class TeraMoENode:
 
         self.compute_timer.stop()
         self.combine_timer.start()
-        notify_done_event = deep_ep.Buffer.capture()
 
-        out, _, event = self.buffer.combine(
-            zipped_out, handle, async_finish=True, previous_event=notify_done_event,
-            allocate_on_comm_stream=False)
-
-        # 等 notify 完成也就是 combine 启动才返回, 避免 shared expert 抢 SM
-        notify_done_event.current_stream_wait()
+        with cached_notify_guard() as event:
+            out, _, event = self.buffer.combine(
+                zipped_out, handle, async_finish=True, previous_event=event,
+                allocate_on_comm_stream=False)
 
         self.unzipped_probs = unzipped_probs
         self.o1 = o1
@@ -977,8 +991,10 @@ class TeraMoENode:
         ########################### COMBINE BACKWARD ###########################
 
         # 非 chunk 模式, 可以使用 cache mode, 发送 BF16
-        recv_dout, _, _, _, _, event = self.buffer.dispatch(
-            dout, handle=self.handle, async_finish=True, allocate_on_comm_stream=False)
+        with cached_notify_guard() as event:
+            recv_dout, _, _, _, _, event = self.buffer.dispatch(
+                dout, handle=self.handle, async_finish=True, previous_event=event,
+                allocate_on_comm_stream=False)
 
         self.recv_dout = recv_dout
         self.dispatch_done_event = event
@@ -1006,8 +1022,6 @@ class TeraMoENode:
         H, I = w_gateup.shape[1], w_down.shape[1]
         w_gateup_n = get_quant_weight(w_gateup)
         w_down_n = get_quant_weight(w_down)
-
-        self.o1 = deep_gemm.token_gather(self.o1, self.ordered_to_atomic)
 
         self.dispatch_done_event.current_stream_wait()
         del self.dispatch_done_event
@@ -1039,7 +1053,7 @@ class TeraMoENode:
         del self.o1, do2, self.unzipped_probs
 
         bf16_weight_grad(self.x, do1, w_gateup, self.ks_cpu, self.grouped_layout)
-        bf16_weight_grad(o2, do3, w_down, self.ks_cpu, self.grouped_layout)
+        del self.x, do1
 
         ######### GATEUP_GRAD ##########
 
@@ -1066,13 +1080,17 @@ class TeraMoENode:
         paddle.base.core.nvprof_nvtx_push("wgrad")
         deep_gemm.set_num_sms(self.num_calc_sms)
 
+        bf16_weight_grad(o2, do3, w_down, self.ks_cpu, self.grouped_layout)
+
         paddle.base.core.nvprof_nvtx_pop()
 
     def _backward_serial(self, dout: Tensor):
         ########################### COMBINE BACKWARD ###########################
 
-        recv_dout, _, _, _, _, event = self.buffer.dispatch(
-            dout, handle=self.handle, async_finish=True, allocate_on_comm_stream=False)
+        with cached_notify_guard() as event:
+            recv_dout, _, _, _, _, event = self.buffer.dispatch(
+                dout, handle=self.handle, async_finish=True, previous_event=event,
+                allocate_on_comm_stream=False)
 
         w_gateup, w_down = self.w_gateup, self.w_down
         E, I, H = w_down.shape
@@ -1144,8 +1162,10 @@ class TeraMoENode:
             total_zipped_tokens=len(self.recv_token_indices), num_experts=E)
         del dx, dprobs
 
-        dhidden_states, dtoken_probs, event = self.buffer.combine(
-            drecv_x, self.handle, drecv_probs, async_finish=True, allocate_on_comm_stream=False)
+        with cached_notify_guard() as event:
+            dhidden_states, dtoken_probs, event = self.buffer.combine(
+                drecv_x, self.handle, drecv_probs, async_finish=True, previous_event=event,
+                allocate_on_comm_stream=False)
 
         self.input_grads = (dhidden_states, dtoken_probs)
         self.combine_done_event = event

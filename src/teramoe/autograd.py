@@ -171,8 +171,8 @@ def forward_autograd(
         else:
             activation = {"activation": 3, "arg0": situ_beta, "arg1": situ_linear_beta}
 
-    buffer = get_buffer(group, get_hidden_bytes(hidden_states))
     hs_2d = hidden_states.view([-1, hidden_states.shape[-1]])
+    buffer = get_buffer(group, get_hidden_bytes(hs_2d))
 
     # 通过两个 node 将 teramoe 的流程拆成 dispatch-compute-combine 和 wait 两部分:
     # 1. 前向进行完第一部分之后不等待 combine, 而是继续执行 combine_overlap_handle, 从而实现
