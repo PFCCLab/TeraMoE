@@ -170,6 +170,7 @@ def forward_autograd(
             activation = {"activation": 2, "arg0": situ_beta}
         else:
             activation = {"activation": 3, "arg0": situ_beta, "arg1": situ_linear_beta}
+    barrier_async = getattr(config, "moe_ep_barrier_async", True)
 
     hs_2d = hidden_states.view([-1, hidden_states.shape[-1]])
     buffer = get_buffer(group, get_hidden_bytes(hs_2d))
@@ -181,7 +182,7 @@ def forward_autograd(
     #    其反向恰好在 post 与 pre 之间执行, 从而也能控制它与 combine 进行 overlap
     node = TeraMoENode(
         buffer, hs_2d, topk_weights, topk_indices, w_gateup, w_down, group, num_experts,
-        fp8, fp8_wgrad, chunk_size, num_calc_sms, combine_overlap_ratio, activation)
+        fp8, fp8_wgrad, chunk_size, num_calc_sms, combine_overlap_ratio, activation, barrier_async)
 
     fn_args, fn_out = (), ()
     if combine_overlap_handle is not None:

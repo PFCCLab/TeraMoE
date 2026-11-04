@@ -1,7 +1,4 @@
-import os
-import numpy as np
 from contextlib import contextmanager
-from typing import Callable
 
 import paddle
 import paddle.distributed as dist
@@ -10,183 +7,10 @@ from paddle.distributed.communication.group import Group
 
 from . import deep_ep, deep_gemm
 from .async_utils import AsyncLoad, async_offload, get_profile_timers, started
+from .task_utils import GroupedTaskLauncher, make_batch_task_queue
 
 FP8_ALIGN = 128
 QUANT_BLOCK_SIZE = 512
-
-_grouped_launch_stream = None
-_task_done_event = None
-_sort_map_stream = None
-_sort_map_done_event = None
-
-
-class GroupedTaskLauncher:
-    def __init__(self,
-        funcs: list[Callable[[int], None]],
-        num_tasks: int,
-        dispatch_done_event: deep_ep.EventOverlap | None = None,
-        combine_overlap_ratio: float = 0.0,
-        avg_num_tasks: int = None,
-    ):
-        self._funcs = funcs
-        self._num_tasks = num_tasks
-        self._dispatch_done_event = dispatch_done_event
-        self._combine_overlap_ratio = combine_overlap_ratio
-        self._avg_num_tasks = num_tasks if avg_num_tasks is None else avg_num_tasks
-        self._next_task_idx = 0
-        self._calc_stream = paddle.cuda.current_stream()
-
-        global _grouped_launch_stream, _task_done_event
-        if _grouped_launch_stream is None:
-            _grouped_launch_stream = paddle.cuda.Stream()
-        if _task_done_event is None:
-            _task_done_event = paddle.cuda.Event()
-
-    def run_dispatch_overlap(self, dual_stream: bool = False):
-        """Stage A: compute overlaps with dispatch util dispatch finishes."""
-        assert self._dispatch_done_event is not None, (
-            "dispatch_overlap requires dispatch_done_event be given")
-        if dual_stream:
-            return self._run_dispatch_overlap_dual_stream()
-
-        for task_idx in range(self._num_tasks):
-            paddle.base.core.nvprof_nvtx_push(f"A{task_idx}")
-            for func in self._funcs:
-                func(task_idx)
-            paddle.base.core.nvprof_nvtx_pop()
-
-            # 只提前发射一个 task, 从而及时根据 dispatch 完成状态切换 SM 数
-            if task_idx > 0:
-                _task_done_event.synchronize()
-            _task_done_event.record()
-            self._next_task_idx = task_idx + 1
-
-            # 当 dispatch 恰好完成时, 切换至纯计算模式
-            if self._dispatch_done_event.query():
-                break
-
-        return self._next_task_idx
-
-    def _run_dispatch_overlap_dual_stream(self):
-        assert len(self._funcs) == 4, "dual stream is for 4-stage task"
-        gemm0, act, gemm1, zip = self._funcs
-        streams = [self._calc_stream, _grouped_launch_stream]
-        stream_bases = [stream.stream_base for stream in streams]
-
-        for task_idx in range(self._num_tasks):
-            i = task_idx % 2
-            paddle.base.core._set_current_stream(stream_bases[i])
-
-            paddle.base.core.nvprof_nvtx_push(f"A{task_idx}")
-            gemm0(task_idx)
-
-            # 上一个 task 的 zip
-            if task_idx > 0:
-                paddle.base.core._set_current_stream(stream_bases[1 - i])
-                zip(task_idx - 1)
-                paddle.base.core._set_current_stream(stream_bases[i])
-
-            act(task_idx)
-            _task_done_event.record()
-
-            gemm1(task_idx)
-            paddle.base.core.nvprof_nvtx_pop()
-
-            # 等当前 task 的 act 完成才开始发射下一个 task
-            _task_done_event.synchronize()
-            self._next_task_idx = task_idx + 1
-
-            # 当 dispatch 恰好完成时, 切换至纯计算模式
-            if self._dispatch_done_event.query():
-                break
-
-        # 结束 dispatch overlap 阶段时, 在最后一个 task 所在的 stream 发射其 zip
-        if self._num_tasks > 0:
-            zip(task_idx)
-            paddle.base.core._set_current_stream(stream_bases[0])
-
-        return self._next_task_idx
-
-    def _grouped_launch(self, begin, end):
-        """
-        轮流在 calc/comm 两个 stream 上对 funcs 进行分组发射.
-
-        使用两个 stream 可以让前后两个 kernel 重叠, 让下一个 kernel 充分利用上一个 kernel
-        的尾部空出来的 SM, 达到类似 group_gemm 的效果.
-        """
-        # 对于每组 func，总是从主 stream 开始发射，这样同一个 task_idx 的前后 func
-        # 必定在同一个 stream 上，可以天然保证同步
-        stream_bases = [self._calc_stream.stream_base, _grouped_launch_stream.stream_base]
-        i = 0
-
-        for n, func in enumerate(self._funcs):
-            # 每组 func 开始前让副 stream 等待一次主 stream, 保持组的边界;
-            # 其实从正确性上没有必要, 只是让 timeline 更整齐, 对性能影响未知
-            _task_done_event.record()
-            _grouped_launch_stream.wait_event(_task_done_event)
-
-            paddle.base.core.nvprof_nvtx_push(f"G{n}")
-            for i, task_idx in enumerate(range(begin, end)):
-                # 直接调用 core 比用 stream_guard 开销更低, 这里的发射速度非常关键
-                if i != 0:
-                    paddle.base.core._set_current_stream(stream_bases[i % 2])
-                func(task_idx)
-            paddle.base.core.nvprof_nvtx_pop()
-
-            # 每组 func 调用结束时恢复到默认计算流
-            if i % 2 != 0:
-                paddle.base.core._set_current_stream(stream_bases[0])
-
-        # 仅结束时主 stream 需要等待一次副 stream
-        _task_done_event.record(_grouped_launch_stream)
-        self._calc_stream.wait_event(_task_done_event)
-
-    def run_compute(self):
-        """Stage B: compute only."""
-        begin = self._next_task_idx
-        # 将 combine_overlap_ratio 的 task 留给 combine 进行 overlap, 但是 task 基数由均衡
-        # 情况确定, 以此保持留出的 task 数量恒定 (而不是比例恒定)
-        num_overlap_tasks = self._avg_num_tasks * self._combine_overlap_ratio
-        end = max(int(self._num_tasks - num_overlap_tasks), begin)  # excluded
-
-        if begin < end:
-            paddle.base.core.nvprof_nvtx_push(f"Bx{end - begin}")
-            self._grouped_launch(begin, end)
-            paddle.base.core.nvprof_nvtx_pop()
-
-        self._next_task_idx = end
-        return end
-
-    def run_combine_overlap(self):
-        """Stage C: compute overlaps with combine."""
-        for task_idx in range(self._next_task_idx, self._num_tasks):
-            paddle.base.core.nvprof_nvtx_push(f"C{task_idx}")
-            for func in self._funcs:
-                func(task_idx)
-            paddle.base.core.nvprof_nvtx_pop()
-            self._next_task_idx = task_idx + 1
-
-    def __del__(self):
-        assert self._next_task_idx == self._num_tasks, (
-            f"tasks not correctly launched: next={self._next_task_idx} total={self._num_tasks}")
-
-
-def make_batch_task_queue(tokens_per_expert: list[int]) -> np.ndarray:
-    """Make a fine-grained task queue with chunk size 128 for batched launch."""
-    tokens_per_expert = np.array(tokens_per_expert, np.int32)
-    tasks_per_expert = (tokens_per_expert + FP8_ALIGN - 1) // FP8_ALIGN
-    task_queue = np.empty((tasks_per_expert.sum(), 4), np.int32)
-
-    # expert_id can be omitted
-    task_queue[:, 1] = np.arange(0, len(task_queue) * FP8_ALIGN, FP8_ALIGN, np.int32)
-    task_queue[:, 2] = FP8_ALIGN
-    task_queue[:, 3] = 1
-
-    last_task_per_expert = tasks_per_expert.cumsum() - 1
-    last_size_per_expert = tokens_per_expert % FP8_ALIGN
-    task_queue[last_task_per_expert, 2] = np.where(
-        last_size_per_expert, last_size_per_expert, FP8_ALIGN)
-    return task_queue
 
 
 def quant_input(x: Tensor, transpose_scale: bool = False) -> tuple[Tensor, Tensor]:
@@ -302,6 +126,7 @@ class TeraMoENode:
         num_calc_sms: int,
         combine_overlap_ratio: float,
         activation: dict[str, int | float],
+        barrier_async: bool,
     ):
         self.buffer = buffer
         self.hidden_states = hidden_states
@@ -317,9 +142,12 @@ class TeraMoENode:
         self.num_calc_sms = num_calc_sms
         self.combine_overlap_ratio = combine_overlap_ratio
         self.activation = activation
+        self.barrier_async = barrier_async
+
         self.avg_tokens_per_card = token_indices.size  # seqlen * topk
         self.avg_num_tasks = int(self.avg_tokens_per_card / chunk_size + len(w_gateup) / 2)
         self.enable_overlap = self.buffer.runtime.get_num_rdma_ranks() > 1
+
         timers = get_profile_timers()
         self.dispatch_timer = timers("dispatch", use_event=True)
         self.compute_timer = timers("fusion_mlp", use_event=True)
@@ -337,9 +165,8 @@ class TeraMoENode:
             [self.group.nranks, -1]).sum(axis=1, dtype="int32")
         dist.all_reduce(global_num_tokens_per_card, group=self.group)
         value = global_num_tokens_per_card.max()
-        flag = os.getenv("FLEET_MOE_EP_BARRIER_ASYNC")
-        is_async = flag is None or paddle.utils.strtobool(flag)
-        self.max_tokens_per_card = async_offload(value) if is_async else value.pin_memory()
+        self.max_tokens_per_card = (
+            async_offload(value) if self.barrier_async else value.pin_memory())
 
     def forward(self):
         """Forward dispatch, compute and combine.
@@ -867,12 +694,6 @@ class TeraMoENode:
         paddle.base.core.nvprof_nvtx_pop()
 
     def _backward_fp8(self, dout: Tensor):
-        global _sort_map_stream, _sort_map_done_event
-        if _sort_map_stream is None:
-            _sort_map_stream = paddle.cuda.Stream()
-        if _sort_map_done_event is None:
-            _sort_map_done_event = paddle.cuda.Event()
-
         ########################### COMBINE BACKWARD ###########################
 
         dout_quant = quant_input(dout)
@@ -896,24 +717,10 @@ class TeraMoENode:
         do3_fp8, do3_scale = do3
         do3 = (do3_fp8, do3_scale.T)
 
-        # 将 wgrad 的 recv_x requant 提前到 dispatch overlap, 因为一般 gemm 刚开始都在空等;
-        # 该 sort_map 使用的都是前向的数据, 所以与反向 dispatch 没有数据依赖
+        # 将 wgrad 的 recv_x requant 提前到 dispatch overlap, 因为一般 gemm 刚开始都在空等
         x_w = deep_gemm.requant_wgrad_input(
             self.recv_x[0], self.recv_x[1].T.contiguous().T, self.ordered_to_zip)
-
-        # 复用 ordered_to_zip 给 sort_map, 这要求 sort_map 必须在 requant 完成后才执行
-        ordered_to_atomic = self.ordered_to_zip
-        del self.recv_x, self.ordered_to_zip
-        _task_done_event.record()
-        _sort_map_stream.wait_event(_task_done_event)
-
-        # 将反向 sort_map 用异步流紧跟在反向 dispatch 之后, 因为 dispatch 刚结束时 gemm 还没有立即切换到
-        # compute 阶段, 此时 SM 有空余, 可以充分利用起来
-        with paddle.device.stream_guard(_sort_map_stream):
-            event.current_stream_wait()
-            deep_gemm.sort_map(zip_to_atomic_bwd, self.m_start_gpu, self.m_start_wgrad[-1],
-                               None, ordered_to_atomic, self.m_start_wgrad_gpu)
-            _sort_map_done_event.record()
+        del self.recv_x
 
         ############################ GEMM BACKWARD #############################
 
@@ -977,7 +784,10 @@ class TeraMoENode:
 
         paddle.base.core.nvprof_nvtx_push("wgrad")
 
-        paddle.cuda.current_stream().wait_event(_sort_map_done_event)
+        ordered_to_atomic = self.ordered_to_zip  # reuse forward map
+        deep_gemm.sort_map(zip_to_atomic_bwd, self.m_start_gpu, self.m_start_wgrad[-1], None,
+                           ordered_to_atomic, self.m_start_wgrad_gpu)
+
         do1_w = deep_gemm.requant_wgrad_input(*do1, ordered_to_atomic)
         o2_w = deep_gemm.requant_wgrad_input(*o2_bwd, ordered_to_atomic)
         do3_w = deep_gemm.requant_wgrad_input(*do3, ordered_to_atomic)
