@@ -4,6 +4,10 @@ import paddle.distributed as dist
 from paddle.base.core import task
 from paddle.distributed.communication.group import Group
 
+from .triton_ops import topk_to_dense, dense_to_topk
+
+TRITON_FUSION = True
+
 
 def weight_sync(group: Group, physical_to_logical_map: list[int], master: list[Tensor],
                 replica: list[Tensor]) -> tuple[list[task], int]:
@@ -84,17 +88,21 @@ def update_placement(
     NVL_DOMAIN_SIZE = 8
     EP = group.world_size
     seq_len, top_k = topk_ids.shape
-    padding_mask = topk_ids == -1
-    assert (padding_mask.any(axis=1) == padding_mask.all(axis=1)).all()
 
     # preprocess: keep the order of topk_probs
-    topk_probs_for_sort = paddle.arange(top_k, dtype="int32").float().broadcast_to(topk_probs.shape)
-    probs = paddle.zeros([seq_len, num_experts]).put_along_axis(topk_ids, topk_probs_for_sort, axis=-1)
-    routing_map = paddle.zeros_like(probs, dtype="uint8").put_along_axis(
-        topk_ids, paddle.ones([1], dtype="uint8"), axis=-1)
+    if TRITON_FUSION:
+        probs, routing_map, expert_loads = topk_to_dense(topk_ids, num_experts)
+    else:
+        padding_mask = topk_ids == -1
+        assert (padding_mask.any(axis=1) == padding_mask.all(axis=1)).all()
+        topk_probs_for_sort = paddle.arange(top_k, dtype="int32").float()
+        probs = paddle.zeros([seq_len, num_experts]).put_along_axis_(
+            topk_ids, topk_probs_for_sort, axis=-1)
+        routing_map = paddle.zeros_like(probs, dtype="uint8").put_along_axis_(
+            topk_ids, (~padding_mask).view("uint8"), axis=-1)
+        expert_loads = routing_map.sum(axis=0, dtype="int32")
 
     paddle.base.core.nvprof_nvtx_push("all_gather")
-    expert_loads = routing_map.sum(axis=0, dtype="int32")
     expert_loads_per_rank = paddle.empty([EP, num_experts], dtype="int32")
     dist.all_gather(expert_loads_per_rank, expert_loads, group)
     expert_loads = expert_loads_per_rank.sum(axis=0, dtype="int32")
@@ -132,20 +140,22 @@ def update_placement(
     paddle.base.core.nvprof_nvtx_pop()
 
     # post process: restore the order of topk_probs
-    expected_routing_map = paddle.zeros_like(expanded_routing_map, dtype="uint8").put_along_axis(
-        topk_ids + topk_ids // (num_experts // EP) * num_replicas, paddle.ones([1], dtype="uint8"),
-        axis=-1)
-    expanded_probs = paddle.where(
-        expanded_routing_map, expanded_probs, paddle.full_like(expanded_probs, float("inf")))
-    rerouted_topk_probs, rerouted_topk_ids = expanded_probs.topk(
-        top_k, axis=1, sorted=True, largest=False)
-    rerouted_topk_probs = paddle.where(
-        padding_mask, paddle.zeros_like(rerouted_topk_probs), rerouted_topk_probs)
-    rerouted_topk_ids = paddle.where(
-        padding_mask, paddle.full_like(rerouted_topk_ids, -1), rerouted_topk_ids)
-    rerouted_topk_probs = topk_probs.take_along_axis(rerouted_topk_probs.int32(), axis=1)
-
-    assert (topk_probs == rerouted_topk_probs).all()
+    if TRITON_FUSION:
+        # topk_probs order is preserved, only the ids are remapped to physical experts
+        rerouted_topk_probs = topk_probs
+        rerouted_topk_ids = dense_to_topk(
+            expanded_probs, expanded_routing_map, top_k, topk_ids.dtype)
+    else:
+        expanded_probs = paddle.where(
+            expanded_routing_map, expanded_probs, paddle.full_like(expanded_probs, float("inf")))
+        rerouted_topk_probs, rerouted_topk_ids = expanded_probs.topk(
+            top_k, axis=1, sorted=True, largest=False)
+        rerouted_topk_probs = paddle.where(
+            padding_mask, paddle.zeros_like(rerouted_topk_probs), rerouted_topk_probs)
+        rerouted_topk_ids = paddle.where(
+            padding_mask, paddle.full_like(rerouted_topk_ids, -1), rerouted_topk_ids)
+        rerouted_topk_probs = topk_probs.take_along_axis(rerouted_topk_probs.int32(), axis=1)
+        assert (topk_probs == rerouted_topk_probs).all()
 
     return rerouted_topk_probs, rerouted_topk_ids, physical_to_logical_map
 
