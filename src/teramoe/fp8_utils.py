@@ -12,6 +12,8 @@ from .task_utils import GroupedTaskLauncher, make_batch_task_queue
 FP8_ALIGN = 128
 QUANT_BLOCK_SIZE = 512
 
+_global_previous_event = None
+
 
 def quant_input(x: Tensor, transpose_scale: bool = False) -> tuple[Tensor, Tensor]:
     """对于 hidden_states, 在 hidden 维上使用 128 分块量化."""
@@ -174,6 +176,10 @@ class TeraMoENode:
         This function has no input/output, as the inputs are set at node initialization,
         and the output is hold util the user calls forward_wait.
         """
+        # 本次 dispatch 必须在上一次 combine 结束之后才能调用, 避免 allocator 频繁查询 event
+        if _global_previous_event is not None:
+            _global_previous_event.synchronize()
+
         paddle.base.core.nvprof_nvtx_push("teramoe_forward")
         self.dispatch_timer.start()
         if self.enable_overlap:
@@ -226,7 +232,6 @@ class TeraMoENode:
         )
 
         del self.hidden_states
-        self.recv_x = recv_x
         self.tokens_per_expert = tokens_per_expert
         self.unzipped_probs = unzipped_probs
         self.zip_to_atomic = zip_to_atomic
@@ -270,17 +275,36 @@ class TeraMoENode:
 
         ############################# COMBINE FORWARD ##############################
 
-        out, _, event = self.buffer.combine(
-            zipped_out, handle, async_finish=True, allocate_on_comm_stream=False,
-            zip_done=zip_done)
+        with cached_notify_guard() as event:
+            out, _, event = self.buffer.combine(
+                zipped_out, handle, async_finish=True, previous_event=event,
+                allocate_on_comm_stream=False, zip_done=zip_done)
 
-        deep_gemm.set_num_sms(self.num_calc_sms)
-        self.combine_timer.start()
-        task_launcher.run_combine_overlap()
+            deep_gemm.set_num_sms(self.num_calc_sms)
+            self.combine_timer.start()
+            task_launcher.run_combine_overlap()
 
         self.o1 = o1
         self.out = out
         self.combine_done_event = event
+
+        ################################ WGRAD #################################
+
+        ks_cpu, m_start = [], [0]
+        for n in tokens_per_expert:
+            ks_cpu.append((n + FP8_ALIGN - 1) // FP8_ALIGN * FP8_ALIGN)
+            m_start.append(m_start[-1] + ks_cpu[-1])
+
+        async_load = AsyncLoad()
+        t = async_load(ks_cpu + m_start, dtype="int32")
+        self.grouped_layout, self.m_start = t[:len(ks_cpu)], t[len(ks_cpu):]
+        self.ks_cpu = ks_cpu
+
+        # 提前为 wgrad 恢复顺序
+        ordered_to_atomic = paddle.empty([num_unzipped_tokens], dtype="int32")
+        deep_gemm.sort_map(zip_to_atomic, self.m_start, num_unzipped_tokens, None,
+                           ordered_to_atomic)
+        self.x = deep_gemm.token_gather(unzipped_tokens, ordered_to_atomic)
 
     def _forward_fp8(self):
         ########################### DISPATCH FORWARD ###########################
@@ -329,8 +353,8 @@ class TeraMoENode:
         unzipped_x = (unzipped_tokens, unzipped_scale.T)
 
         del hidden_states
-        self.recv_x = recv_x
         self.tokens_per_expert = tokens_per_expert
+        self.unzipped_x = unzipped_x
         self.unzipped_probs = unzipped_probs
         self.zip_to_atomic = zip_to_atomic
         if not self.fp8_wgrad:
@@ -397,8 +421,6 @@ class TeraMoENode:
 
         ################################ WGRAD #################################
 
-        # NOTES: 将 wgrad 的一部分工作提前到前向, 降低反向负载
-
         # 各专家 token 数重新向 512 对齐
         ks_cpu, m_start, m_start_wgrad = [], [0], [0]
         wgrad_align = QUANT_BLOCK_SIZE if self.fp8_wgrad else FP8_ALIGN
@@ -417,15 +439,15 @@ class TeraMoENode:
         self.tokens_per_expert_gpu = t[len(ks_cpu) + len(m_start) * 2:]
 
         self.ordered_to_zip = paddle.empty([m_start_wgrad[-1]], dtype="int32")
-        ordered_to_atomic = paddle.empty_like(self.ordered_to_zip) if not self.fp8_wgrad else None
+        self.ordered_to_atomic = paddle.empty_like(self.ordered_to_zip)
         deep_gemm.sort_map(zip_to_atomic, self.m_start_gpu, m_start_wgrad[-1],
-                           self.ordered_to_zip, ordered_to_atomic, self.m_start_wgrad_gpu)
+                           self.ordered_to_zip, self.ordered_to_atomic, self.m_start_wgrad_gpu)
 
         # 提前为 bf16_wgrad 恢复顺序
         if not self.fp8_wgrad:
-            self.o1 = deep_gemm.token_gather(self.o1, ordered_to_atomic)
+            self.o1 = deep_gemm.token_gather(self.o1, self.ordered_to_atomic)
             self.unzipped_probs = deep_gemm.token_gather(
-                self.unzipped_probs.unsqueeze(1), ordered_to_atomic).squeeze(1)
+                self.unzipped_probs.unsqueeze(1), self.ordered_to_atomic).squeeze(1)
             self.recv_token_indices = self.recv_token_indices.cast("int32")
 
     def _forward_serial(self):
@@ -563,6 +585,8 @@ class TeraMoENode:
 
     def forward_wait(self) -> Tensor:
         """Wait for combine to finish and return the combined result."""
+        global _global_previous_event
+        _global_previous_event = self.combine_done_event
         out = self.out
         self.combine_done_event.current_stream_wait()
         self.combine_timer.stop()
@@ -665,31 +689,16 @@ class TeraMoENode:
 
         paddle.base.core.nvprof_nvtx_push("wgrad")
 
-        ks_cpu, m_start = [], [0]
-        for n in tokens_per_expert:
-            ks_cpu.append((n + FP8_ALIGN - 1) // FP8_ALIGN * FP8_ALIGN)
-            m_start.append(m_start[-1] + ks_cpu[-1])
-
-        async_load = AsyncLoad()
-        t = async_load(ks_cpu + m_start, dtype="int32")
-        grouped_layout, m_start = t[:len(ks_cpu)], t[len(ks_cpu):]
-
-        ordered_to_zip = paddle.empty([num_unzipped_tokens], dtype="int32")
         ordered_to_atomic = paddle.empty([num_unzipped_tokens], dtype="int32")
-        deep_gemm.sort_map(zip_to_atomic_bwd, m_start, num_unzipped_tokens,
-                           ordered_to_zip, ordered_to_atomic)
+        deep_gemm.sort_map(zip_to_atomic_bwd, self.m_start, num_unzipped_tokens, None,
+                           ordered_to_atomic)
 
-        # x 从 recv_x 中解压, 这里使用 gather 并非最优性能, 因为重复读了 recv_x 的某些行
-        x_wgrad = deep_gemm.token_gather(self.recv_x, ordered_to_zip)
-        del self.recv_x
-
-        # do1/o2_bwd/do3 从反向 atomic 序的输入重排序为标准 unzip 序
         do1_wgrad = deep_gemm.token_gather(do1, ordered_to_atomic)
         o2_wgrad = deep_gemm.token_gather(o2_bwd, ordered_to_atomic)
         do3_wgrad = deep_gemm.token_gather(do3, ordered_to_atomic)
 
-        bf16_weight_grad(x_wgrad, do1_wgrad, w_gateup, ks_cpu, grouped_layout)
-        bf16_weight_grad(o2_wgrad, do3_wgrad, w_down, ks_cpu, grouped_layout)
+        bf16_weight_grad(self.x, do1_wgrad, w_gateup, self.ks_cpu, self.grouped_layout)
+        bf16_weight_grad(o2_wgrad, do3_wgrad, w_down, self.ks_cpu, self.grouped_layout)
 
         paddle.base.core.nvprof_nvtx_pop()
 
@@ -717,10 +726,9 @@ class TeraMoENode:
         do3_fp8, do3_scale = do3
         do3 = (do3_fp8, do3_scale.T)
 
-        # 将 wgrad 的 recv_x requant 提前到 dispatch overlap, 因为一般 gemm 刚开始都在空等
-        x_w = deep_gemm.requant_wgrad_input(
-            self.recv_x[0], self.recv_x[1].T.contiguous().T, self.ordered_to_zip)
-        del self.recv_x
+        # 将 wgrad 的 x requant 提前到 dispatch overlap, 因为一般 gemm 刚开始都在空等
+        x_w = deep_gemm.requant_wgrad_input(*self.unzipped_x, self.ordered_to_atomic)
+        del self.unzipped_x
 
         ############################ GEMM BACKWARD #############################
 
@@ -809,23 +817,16 @@ class TeraMoENode:
         self.recv_dout = recv_dout
         self.dispatch_done_event = event
 
-        recv_indices = self.recv_token_indices
-        recv_probs = paddle.empty(recv_indices.shape, dtype="float32")  # placeholder
         self.m_indices = paddle.concat([
             paddle.full([self.ks_cpu[i]], i, dtype="int32")
             for i, n in enumerate(self.tokens_per_expert)
         ])
 
-        # x 在 wgrad 时才用, 这里提前到 dispatch 以进行 overlap
-        recv_x_dequant = dequant_input(*self.recv_x)
-        del self.recv_x
+        self.x = deep_gemm.token_gather(
+            self.unzipped_x[0], self.ordered_to_atomic, self.unzipped_x[1])
+        del self.unzipped_x
 
-        self.x, self.rowmap, _, _ = paddle.nn.functional.moe_permute(
-            recv_x_dequant, None, recv_indices, recv_probs,
-            padding_alignment=FP8_ALIGN,
-            num_experts=len(self.w_gateup),
-            tokens_per_expert=self.tokens_per_expert,
-        )
+        self.rowmap = deep_gemm.gen_rowmap(self.recv_token_indices, self.tokens_per_expert_gpu)
 
     def _backward_fp8_bf16_wgrad_wait(self):
         w_gateup, w_down = self.w_gateup, self.w_down
@@ -987,6 +988,8 @@ class TeraMoENode:
                 self._backward_fp8_bf16_wgrad_wait()
         paddle.base.core.nvprof_nvtx_pop()
 
+        global _global_previous_event
+        _global_previous_event = self.combine_done_event
         input_grads = self.input_grads
         self.combine_done_event.current_stream_wait()
         del self.input_grads, self.combine_done_event

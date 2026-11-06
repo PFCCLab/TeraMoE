@@ -213,8 +213,9 @@ def check(fleet_out, teramoe_out):
             print(f"{name}: 0.0")
         elif ((USE_FP8 and USE_FP8_WGRAD and name.startswith("w")) or
               (USE_SITU and name == "hs_grad")):
-            # wgrad 的绝对误差比较大，只能比较 cos 相似性
-            cos = float(F.cosine_similarity(ref.flatten(), tgt.flatten(), axis=0, eps=0))
+            # cos 相似性比 atol/rtol 更能衡量梯度的相对误差
+            cos = float(F.cosine_similarity(
+                ref.flatten().float64(), tgt.flatten().float64(), axis=0, eps=0))
             print(f"{name}: avg={avg:e} max={max:e} cos={cos:.6f}")
             ok = ok and cos > 0.999
         else:
