@@ -8,7 +8,7 @@ from paddle.autograd import PyLayer
 from paddle.distributed.communication.group import Group
 
 from .fp8_utils import FP8_ALIGN, TeraMoENode
-from .fused_a2a import get_buffer, get_hidden_bytes, infer_buffer_config
+from .fused_a2a import get_buffer, get_hidden_bytes, get_replica_bytes, infer_buffer_config
 
 
 if TYPE_CHECKING:
@@ -140,13 +140,13 @@ def forward_autograd(
 
     # Check weights
     w_gateup, w_down = grouped_gemm_experts.weight1, grouped_gemm_experts.weight2
-    assert (
-        w_gateup.ndim == 3 and w_down.ndim == 3 and w_gateup.shape[0] == w_down.shape[0] and
-        w_gateup.shape[1] == w_down.shape[2] and w_gateup.shape[2] == w_down.shape[1] * 2
-    ), (
-        "Requires weight1 have shape [E, H, 2I], weight2 have shape [E, I, H], got "
-        f"weight1.shape={w_gateup.shape}, weight2.shape={w_down.shape}."
-    )
+    try:
+        (E, H, I2), (E_, I, H_) = w_gateup.shape, w_down.shape
+        assert E == E_ and H == H_ and I2 == I * 2
+    except:
+        raise ValueError(
+            "Requires weight1 have shape [E, H, 2I], weight2 have shape [E, I, H], got "
+            f"weight1.shape={w_gateup.shape}, weight2.shape={w_down.shape}.")
     assert w_gateup.is_contiguous() and w_down.is_contiguous(), "Requires weights be contiguous."
 
     # Check hidden
@@ -171,9 +171,10 @@ def forward_autograd(
         else:
             activation = {"activation": 3, "arg0": situ_beta, "arg1": situ_linear_beta}
     barrier_async = getattr(config, "moe_ep_barrier_async", True)
+    num_replicas = 2
 
     hs_2d = hidden_states.view([-1, hidden_states.shape[-1]])
-    buffer = get_buffer(group, get_hidden_bytes(hs_2d))
+    buffer = get_buffer(group, get_hidden_bytes(hs_2d), get_replica_bytes(num_replicas, H, I))
 
     # 通过两个 node 将 teramoe 的流程拆成 dispatch-compute-combine 和 wait 两部分:
     # 1. 前向进行完第一部分之后不等待 combine, 而是继续执行 combine_overlap_handle, 从而实现
@@ -182,7 +183,8 @@ def forward_autograd(
     #    其反向恰好在 post 与 pre 之间执行, 从而也能控制它与 combine 进行 overlap
     node = TeraMoENode(
         buffer, hs_2d, topk_weights, topk_indices, w_gateup, w_down, group, num_experts,
-        fp8, fp8_wgrad, chunk_size, num_calc_sms, combine_overlap_ratio, activation, barrier_async)
+        fp8, fp8_wgrad, chunk_size, num_calc_sms, num_replicas, combine_overlap_ratio, activation,
+        barrier_async)
 
     fn_args, fn_out = (), ()
     if combine_overlap_handle is not None:

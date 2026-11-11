@@ -22,6 +22,24 @@ def get_hidden_bytes(x: paddle.Tensor) -> int:
     return x.shape[1] * max(x.element_size(), 2)
 
 
+def get_replica_bytes(num_replicas: int, hidden_size: int, moe_intermediate_size: int) -> int:
+    """Calculate number of bytes for replica buffer.
+
+    Args:
+        num_replicas (int): Number of replica experts per rank, 0 to disable the replica buffer
+        hidden_size (int): Hidden size of the experts
+        moe_intermediate_size (int): Intermediate size of the experts
+
+    Returns:
+        int: Number of replica buffer bytes
+    """
+    # Replica buffer holds w_gateup [H, 2I] and w_down [I, H] in BF16 (also for FP8)
+    # plus their FP32 grads
+    num_replica_bytes = num_replicas * 3 * hidden_size * moe_intermediate_size * (2 + 4)
+    num_replica_bytes = (num_replica_bytes + 127) // 128 * 128
+    return num_replica_bytes
+
+
 def configure_buffer(num_sms=None, dispatch_config=None, combine_config=None):
     """
     Configure the runtime parameters for deep_ep kernels.
@@ -70,12 +88,13 @@ def infer_buffer_config() -> int:
     return _num_calc_sms
 
 
-def get_buffer(group: Group, hidden_bytes: int):
+def get_buffer(group: Group, hidden_bytes: int, num_replica_bytes: int = 0):
     """Get or create a buffer for all-to-all communication.
 
     Args:
         group (paddle.distributed.ProcessGroup): Process group for communication
         hidden_bytes (int): Number of hidden bytes needed
+        num_replica_bytes (int): Number of replica buffer bytes needed, 0 to disable the replica buffer
 
     Returns:
         Buffer: Communication buffer
@@ -103,11 +122,13 @@ def get_buffer(group: Group, hidden_bytes: int):
         or _buffer.group != group
         or _buffer.num_nvl_bytes < num_nvl_bytes
         or _buffer.num_rdma_bytes < num_rdma_bytes
+        or _buffer.num_replica_bytes < num_replica_bytes
     ):
         _buffer = deep_ep.Buffer(
             group,
             num_nvl_bytes,
             num_rdma_bytes,
+            num_replica_bytes,
             num_qps_per_rank=max(24, deep_ep.Buffer.num_sms),
         )
     return _buffer

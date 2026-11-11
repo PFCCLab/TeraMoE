@@ -162,5 +162,5 @@ def update_placement(
 
 def prioritize_comm_stream():
     """Launch some dummy kernerls in calc stream to let comm kernels launch first."""
-    for _ in range(3):
+    for _ in range(2):
         paddle.zeros([1])
