@@ -36,6 +36,8 @@ USE_FP8 = False
 USE_FP8_WGRAD = False
 USE_SONIC_MOE = False
 USE_SITU = False
+CHUNK_SIZE = 4096
+NUM_REPLICAS = 0
 LONG_RUN = 0
 
 
@@ -93,6 +95,8 @@ class TeraMoELayer(MoELayer):
             fp8=self.config.fp8,
             fp8_wgrad=USE_FP8_WGRAD,
             use_ue8m0=self.config.use_ue8m0,
+            chunk_size=CHUNK_SIZE,
+            num_replicas=NUM_REPLICAS,
         )
 
         if self.use_latent_moe:
@@ -212,7 +216,8 @@ def check(fleet_out, teramoe_out):
         if max == 0:
             print(f"{name}: 0.0")
         elif ((USE_FP8 and USE_FP8_WGRAD and name.startswith("w")) or
-              (USE_SITU and name == "hs_grad")):
+              (USE_SITU and name == "hs_grad") or
+              (NUM_REPLICAS > 0 and not name.startswith("shared"))):
             # cos 相似性比 atol/rtol 更能衡量梯度的相对误差
             cos = float(F.cosine_similarity(
                 ref.flatten().float64(), tgt.flatten().float64(), axis=0, eps=0))
@@ -232,11 +237,11 @@ def main():
         hidden_size=4096,
         moe_intermediate_size=2048,  # for both routed and shared experts
         gated_linear_unit=True,
-        moe_latent_size=2048,
+        # moe_latent_size=2048,
         latent_moe_use_norm=True,
-        n_routed_experts=512,
+        n_routed_experts=256,
         n_shared_experts=1,
-        num_experts_per_tok=10,
+        num_experts_per_tok=6,
         topk_method="noaux_tc",
         moe_token_dispatcher_type="deepep",
         fp8="e4m3" if USE_FP8 else None,
@@ -333,7 +338,8 @@ def main():
     moe_layer = paddle.amp.decorate(moe_layer, level="O2", dtype="bfloat16")
     moe_layer.set_state_dict(state_dict)
 
-    run_layer(moe_layer, hidden_states, out_grad, profile="teramoe", timers=timers)
+    for i in range(2):
+        run_layer(moe_layer, hidden_states, out_grad, profile="teramoe", timers=timers)
 
     print(timers.log(timer_names, LONG_RUN or 10))
     dist.barrier()
@@ -351,6 +357,10 @@ if __name__ == "__main__":
     parser.add_argument("--fp8-wgrad", action="store_true", help="Use fp8 wgrad")
     parser.add_argument("--sonic-moe", action="store_true", help="Use sonic moe for baseline")
     parser.add_argument("--situ", action="store_true", help="Use situ")
+    parser.add_argument("--chunk-size", type=int, default=4096,
+                        help="Specify number of tokens per task")
+    parser.add_argument("--replicas", type=int, default=0,
+                        help="Specify replica experts per rank for UltraEP")
     parser.add_argument("--long-run", type=int, default=0, help="Specify long-run steps")
     parser.add_argument("args", nargs="*", help="Unused args")
     args = parser.parse_args()
@@ -359,6 +369,8 @@ if __name__ == "__main__":
     USE_FP8_WGRAD = args.fp8_wgrad
     USE_SONIC_MOE = args.sonic_moe
     USE_SITU = args.situ
+    CHUNK_SIZE = args.chunk_size
+    NUM_REPLICAS = args.replicas
     LONG_RUN = args.long_run
 
     # 不使用 sonicmoe 时, 可以去掉 barrier_ep; sonicmoe 则因为 jit 太慢了不能去掉

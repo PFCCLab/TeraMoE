@@ -81,7 +81,7 @@ def grad_sync(group: Group, physical_to_logical_map: list[int], replica: list[Te
 
 def update_placement(
     group: Group, topk_probs: Tensor, topk_ids: Tensor, num_experts: int, num_replicas: int
-) -> tuple[Tensor, Tensor, Tensor]:
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     """Update expert placement for a single layer based on real-time load statistics."""
     import ultra_ep
 
@@ -157,7 +157,7 @@ def update_placement(
         rerouted_topk_probs = topk_probs.take_along_axis(rerouted_topk_probs.int32(), axis=1)
         assert (topk_probs == rerouted_topk_probs).all()
 
-    return rerouted_topk_probs, rerouted_topk_ids, physical_to_logical_map
+    return rerouted_topk_probs, rerouted_topk_ids, physical_to_logical_map, expert_loads
 
 
 def prioritize_comm_stream():

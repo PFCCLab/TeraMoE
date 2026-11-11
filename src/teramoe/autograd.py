@@ -101,8 +101,9 @@ def forward_autograd(
     use_ue8m0: bool = True,
     chunk_size: int = 4096,
     num_calc_sms: int | None = None,
-    combine_overlap_ratio: float = 0.1,
-):
+    combine_overlap_ratio: float = 0.3,
+    num_replicas: int = 2,
+) -> Tensor:
     """
     Autograd wrapper for TeraMoE.
 
@@ -119,16 +120,20 @@ def forward_autograd(
         fp8 (str, optional): The fp8 data type. Default is None, which uses bf16.
         fp8_wgrad (bool, optional): Whether to use fp8 in weight grad. Default is True.
         use_ue8m0 (bool, optional): Whether to use ue8m0 scale. Default is True.
-        chunk_size (int, optional): Number of tokens in each task. Default is 4096.
+        chunk_size (int, optional): Number of tokens in each task, 0 to disable overlap. Default is 4096.
         num_calc_sms (int, optional): Number of SMs for compute. If not given, infers from the deep_ep config. Default is None.
         combine_overlap_ratio (float, optional): Ratio of tasks to overlap with combine.
+        num_replicas (int, optional): Number of replica experts per rank for UltraEP, 0 to disable UltraEP. Default is 2.
+
+    Returns:
+        out (Tensor): The hidden_states after feed-forward network.
     """
     # Check params
     assert activation_type in ("swiglu", "situ"), (
         f"Only supports swiglu and situ activation, got {activation_type}.")
     assert fp8 is None or fp8 == "e4m3", f"Only supports fp8 e4m3, got {fp8}."
     assert fp8 is None or use_ue8m0, f"Only supports ue8m0 scale."
-    assert isinstance(chunk_size, int) and chunk_size > 0 and chunk_size % FP8_ALIGN == 0, (
+    assert isinstance(chunk_size, int) and chunk_size >= 0 and chunk_size % FP8_ALIGN == 0, (
         f"The chunk_size must be multiple of {FP8_ALIGN}, got {chunk_size}.")
     if num_calc_sms is None:
         num_calc_sms = infer_buffer_config()
@@ -137,6 +142,8 @@ def forward_autograd(
             f"The num_calc_sms must be positive integer, got {num_calc_sms}.")
     assert isinstance(combine_overlap_ratio, (int, float)) and 0 <= combine_overlap_ratio <= 1, (
         f"The combine_overlap_ratio must be in range [0, 1], got {combine_overlap_ratio}.")
+    assert isinstance(num_replicas, int) and num_replicas >= 0, (
+        f"The num_replicas must be non-negative integer, got {num_replicas}.")
 
     # Check weights
     w_gateup, w_down = grouped_gemm_experts.weight1, grouped_gemm_experts.weight2
@@ -171,7 +178,6 @@ def forward_autograd(
         else:
             activation = {"activation": 3, "arg0": situ_beta, "arg1": situ_linear_beta}
     barrier_async = getattr(config, "moe_ep_barrier_async", True)
-    num_replicas = 2
 
     hs_2d = hidden_states.view([-1, hidden_states.shape[-1]])
     buffer = get_buffer(group, get_hidden_bytes(hs_2d), get_replica_bytes(num_replicas, H, I))

@@ -1,3 +1,5 @@
+import logging
+import functools
 from types import SimpleNamespace
 from contextlib import contextmanager
 
@@ -14,7 +16,10 @@ from .placement import update_placement, prioritize_comm_stream
 FP8_ALIGN = 128
 QUANT_BLOCK_SIZE = 512
 
+logger = logging.getLogger(__name__)
+
 _global_previous_event = None
+_global_barrier_ep_event = None
 
 
 def quant_input(x: Tensor, transpose_scale: bool = False) -> tuple[Tensor, Tensor]:
@@ -113,6 +118,11 @@ def cached_notify_guard() -> deep_ep.EventOverlap:
         event.current_stream_wait()
 
 
+@functools.lru_cache(None)
+def warning_once(*args, **kwargs):
+    logger.warning(*args, **kwargs)
+
+
 class TeraMoENode:
     def __init__(
         self,
@@ -149,36 +159,104 @@ class TeraMoENode:
         self.activation = activation
         self.barrier_async = barrier_async
 
+        self.enable_overlap = chunk_size > 0 and self.buffer.runtime.get_num_rdma_ranks() > 1
         self.avg_tokens_per_card = token_indices.size  # seqlen * topk
-        self.avg_num_tasks = int(self.avg_tokens_per_card / chunk_size + len(w_gateup) / 2)
-        self.enable_overlap = self.buffer.runtime.get_num_rdma_ranks() > 1
+        if self.enable_overlap:
+            self.avg_num_tasks = int(self.avg_tokens_per_card / chunk_size + len(w_gateup) / 2)
+        self.barrier_ep_event = None
 
         timers = get_profile_timers()
         self.dispatch_timer = timers("dispatch", use_event=True)
         self.compute_timer = timers("fusion_mlp", use_event=True)
         self.combine_timer = timers("combine", use_event=True)
 
-        # ultraep
+        # UltraEP
         self.num_replicas = num_replicas
         self.num_dispatch_experts = num_experts + self.num_replicas * group.world_size
         self.num_permute_experts = len(w_gateup) + self.num_replicas
-        if num_replicas > 0:
+
+        # Fallback check
+        if self.enable_overlap and self.num_permute_experts > 32:
+            warning_once("TeraMoE: overlap mode doesn't support more than 32 experts per rank. "
+                         "Fallback to serial mode.")
             self.enable_overlap = False
+        if num_replicas > 0 and self.enable_overlap and not self.fp8:
+            warning_once("TeraMoE: overlap mode doesn't support UltraEP with bf16. "
+                         "Fallback to serial mode.")
+            self.enable_overlap = False
+        if num_replicas > 0 and self.fp8 and self.fp8_wgrad:
+            warning_once("TeraMoE: UltraEP doesn't support fp8_wgrad. Fallback to bf16_wgrad.")
+            self.fp8_wgrad = False
 
-    def _reduce_max_tokens_per_card(self, num_tokens_per_expert: Tensor):
-        """归约当前 ep_group 内每个 rank 的展开 token 数的最大值, 用于统计均衡度.
+    def _prepare_dispatch(self):
+        # CPU should wait at the point where all ranks finished all_reduce
+        global _global_barrier_ep_event
+        if _global_barrier_ep_event is None:
+            _global_barrier_ep_event = paddle.cuda.Event()
+        self.barrier_ep_event = _global_barrier_ep_event
 
-        NOTES:
-            1. 通信量为 ep_size 个 int, 成本极低;
-            2. 同时起到了 barrier_ep 的作用, 可选 sync 或 async;
-            3. offload 结果由 notify_dispatch 天然同步, 需要在调用完 dispatch 后才能使用.
-        """
-        global_num_tokens_per_card = num_tokens_per_expert.reshape(
-            [self.group.nranks, -1]).sum(axis=1, dtype="int32")
-        dist.all_reduce(global_num_tokens_per_card, group=self.group)
-        value = global_num_tokens_per_card.max()
-        self.max_tokens_per_card = (
-            async_offload(value) if self.barrier_async else value.pin_memory())
+        # Summarize token statics. Need global all_reduce if not done in update_placement
+        if self.num_replicas > 0:
+            self.barrier_ep_event.record()
+            max_tokens_per_card = self.global_tokens_per_expert.reshape(
+                [self.group.nranks, -1]).sum(axis=1, dtype="int32").max()
+
+        (
+            num_tokens_per_rank,
+            num_tokens_per_rdma_rank,
+            num_tokens_per_expert,
+            is_token_in_rank,
+            previous_event,
+        ) = self.buffer.get_dispatch_layout(
+            self.token_indices,
+            self.num_dispatch_experts,
+            async_finish=False,
+            allocate_on_comm_stream=False,
+        )
+
+        self.dispatch_layout = dict(
+            num_tokens_per_rank=num_tokens_per_rank,
+            num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
+            num_tokens_per_expert=num_tokens_per_expert,
+            is_token_in_rank=is_token_in_rank,
+        )
+
+        if not self.num_replicas > 0:
+            global_tokens_per_card = num_tokens_per_expert.reshape(
+                [self.group.nranks, -1]).sum(axis=1, dtype="int32")
+            dist.all_reduce(global_tokens_per_card, group=self.group)
+            self.barrier_ep_event.record()
+            max_tokens_per_card = global_tokens_per_card.max()
+
+        self.max_tokens_per_card = async_offload(max_tokens_per_card)
+
+    def _dispatch(self, x: Tensor, chunk: bool = False):
+        if not self.barrier_async and self.barrier_ep_event is not None:
+            self.barrier_ep_event.synchronize()
+            self.barrier_ep_event = None
+
+        chunk_args = dict(
+            unzip_alignment=FP8_ALIGN,
+            unzip_chunk_size=self.chunk_size,
+        ) if chunk else {}
+
+        (
+            recv_x, recv_token_indices, recv_token_probs, tokens_per_expert, handle, event,
+            *chunk_outs
+        ) = self.buffer.dispatch(
+            x,
+            topk_idx=self.token_indices,
+            topk_weights=self.token_probs,
+            **self.dispatch_layout,
+            async_finish=True,
+            allocate_on_comm_stream=False,
+            **chunk_args,
+        )
+
+        self.handle = handle
+        self.tokens_per_expert = tokens_per_expert
+
+        return recv_x, recv_token_indices, recv_token_probs, event, *chunk_outs
 
     def _weight_sync(self, weights, num_sms=16):
         if self.fp8:
@@ -200,7 +278,7 @@ class TeraMoENode:
         return out, event
 
     def _get_replica_grads(self):
-        _, H, I = self.w_down.shape
+        _, I, H = self.w_down.shape
         w1_grad, w2_grad = self.buffer.get_replica_grads(self.num_replicas, H, I)
 
         paddle.base.core.nvprof_nvtx_push("grad_reset")
@@ -213,7 +291,7 @@ class TeraMoENode:
         return w1, w2
 
     def _grad_reduce(self, num_sms=8):
-        _, H, I = self.w_down.shape
+        _, I, H = self.w_down.shape
         out = (ensure_wgrad(self.w_gateup), ensure_wgrad(self.w_down))
 
         paddle.base.core.nvprof_nvtx_push("grad_reduce")
@@ -221,7 +299,6 @@ class TeraMoENode:
             self.physical_to_logical_map, out, self.num_replicas, H, I, num_sms, async_finish=True)
         paddle.base.core.nvprof_nvtx_pop()
 
-        prioritize_comm_stream()
         deep_gemm.set_num_sms(deep_gemm.get_num_sms() - num_sms)
 
         return event
@@ -241,9 +318,10 @@ class TeraMoENode:
 
         if self.num_replicas > 0:
             paddle.base.core.nvprof_nvtx_push("update_placement")
-            self.token_probs, self.token_indices, self.physical_to_logical_map = update_placement(
-                self.group, self.token_probs, self.token_indices, self.num_experts,
-                self.num_replicas)
+            self.token_probs, self.token_indices, self.physical_to_logical_map, expert_loads = (
+                update_placement(self.group, self.token_probs, self.token_indices,
+                                 self.num_experts, self.num_replicas))
+            self.global_tokens_per_expert = expert_loads
             paddle.base.core.nvprof_nvtx_pop()
 
         if self.enable_overlap:
@@ -259,45 +337,14 @@ class TeraMoENode:
     def _forward_bf16(self):
         ########################### DISPATCH FORWARD ###########################
 
-        (
-            num_tokens_per_rank,
-            num_tokens_per_rdma_rank,
-            num_tokens_per_expert,
-            is_token_in_rank,
-            previous_event,
-        ) = self.buffer.get_dispatch_layout(
-            self.token_indices,
-            self.num_experts,
-            async_finish=False,
-            allocate_on_comm_stream=False,
-        )
-
-        self._reduce_max_tokens_per_card(num_tokens_per_expert)
-
-        self.dispatch_layout = {
-            "num_tokens_per_rank": num_tokens_per_rank,
-            "num_tokens_per_rdma_rank": num_tokens_per_rdma_rank,
-            "num_tokens_per_expert": num_tokens_per_expert,
-            "is_token_in_rank": is_token_in_rank,
-        }
+        self._prepare_dispatch()
 
         (
-            recv_x, recv_token_indices, recv_token_probs, tokens_per_expert, handle, event,
-            unzipped_tokens, unzipped_probs, atomic_to_zip, zip_to_atomic,
-            num_valid_topk, task_queue,
-        ) = self.buffer.dispatch(
-            self.hidden_states,
-            topk_idx=self.token_indices,
-            topk_weights=self.token_probs,
-            **self.dispatch_layout,
-            async_finish=True,
-            allocate_on_comm_stream=False,
-            unzip_alignment=FP8_ALIGN,
-            unzip_chunk_size=self.chunk_size,
-        )
+            recv_x, recv_token_indices, recv_token_probs, event, unzipped_tokens, unzipped_probs,
+            atomic_to_zip, zip_to_atomic, num_valid_topk, task_queue
+        ) = self._dispatch(self.hidden_states, chunk=True)
 
         del self.hidden_states
-        self.tokens_per_expert = tokens_per_expert
         self.unzipped_probs = unzipped_probs
         self.zip_to_atomic = zip_to_atomic
 
@@ -342,7 +389,7 @@ class TeraMoENode:
 
         with cached_notify_guard() as event:
             out, _, event = self.buffer.combine(
-                zipped_out, handle, async_finish=True, previous_event=event,
+                zipped_out, self.handle, async_finish=True, previous_event=event,
                 allocate_on_comm_stream=False, zip_done=zip_done)
 
             deep_gemm.set_num_sms(self.num_calc_sms)
@@ -356,7 +403,7 @@ class TeraMoENode:
         ################################ WGRAD #################################
 
         ks_cpu, m_start = [], [0]
-        for n in tokens_per_expert:
+        for n in self.tokens_per_expert:
             ks_cpu.append((n + FP8_ALIGN - 1) // FP8_ALIGN * FP8_ALIGN)
             m_start.append(m_start[-1] + ks_cpu[-1])
 
@@ -374,67 +421,47 @@ class TeraMoENode:
     def _forward_fp8(self):
         ########################### DISPATCH FORWARD ###########################
 
+        self._prepare_dispatch()
+
+        w_gateup, w_down = self.w_gateup, self.w_down
+        H, I = w_gateup.shape[1], w_down.shape[1]
+        w_gateup_t = get_quant_weight(w_gateup, transpose=True)
+        w_down_t = get_quant_weight(w_down, transpose=True)
+
+        REPLICA = self.num_replicas > 0
+        if REPLICA:
+            # weight_sync is on the same stream with dispatch and has nothing to overlap.
+            # Use more SMs to make it as fast as possible
+            (w_gateup_replica, w_down_replica), _ = self._weight_sync(
+                (w_gateup_t, w_down_t), self.buffer.num_sms)
+            prioritize_comm_stream()
+        else:
+            w_gateup_replica, w_down_replica = None, None
+
         hidden_states = quant_input(self.hidden_states)
         del self.hidden_states
 
-        (
-            num_tokens_per_rank,
-            num_tokens_per_rdma_rank,
-            num_tokens_per_expert,
-            is_token_in_rank,
-            previous_event,
-        ) = self.buffer.get_dispatch_layout(
-            self.token_indices,
-            self.num_experts,
-            async_finish=False,
-            allocate_on_comm_stream=False,
-        )
-
-        self._reduce_max_tokens_per_card(num_tokens_per_expert)
-
-        self.dispatch_layout = {
-            "num_tokens_per_rank": num_tokens_per_rank,
-            "num_tokens_per_rdma_rank": num_tokens_per_rdma_rank,
-            "num_tokens_per_expert": num_tokens_per_expert,
-            "is_token_in_rank": is_token_in_rank,
-        }
+        ########## DISPATCH ###########
 
         (
-            recv_x, recv_token_indices, recv_token_probs, tokens_per_expert, handle, event,
-            unzipped_tokens, unzipped_probs, atomic_to_zip, zip_to_atomic,
-            num_valid_topk, task_queue,
-        ) = self.buffer.dispatch(
-            hidden_states,
-            topk_idx=self.token_indices,
-            topk_weights=self.token_probs,
-            **self.dispatch_layout,
-            async_finish=True,
-            allocate_on_comm_stream=False,
-            unzip_alignment=FP8_ALIGN,
-            unzip_chunk_size=self.chunk_size,
-        )
+            recv_x, recv_token_indices, recv_token_probs, event, unzipped_tokens, unzipped_probs,
+            atomic_to_zip, zip_to_atomic, num_valid_topk, task_queue
+        ) = self._dispatch(hidden_states, chunk=True)
 
         unzipped_tokens, unzipped_scale = unzipped_tokens
         unzipped_x = (unzipped_tokens, unzipped_scale.T)
 
         del hidden_states
-        self.tokens_per_expert = tokens_per_expert
         self.unzipped_x = unzipped_x
         self.unzipped_probs = unzipped_probs
         self.zip_to_atomic = zip_to_atomic
         if not self.fp8_wgrad:
             self.recv_token_indices = recv_token_indices
-            self.handle = handle
 
         ############################# GEMM FORWARD #############################
 
-        w_gateup, w_down = self.w_gateup, self.w_down
-        H, I = w_gateup.shape[1], w_down.shape[1]
         num_recv_tokens = len(recv_x[0])
         num_unzipped_tokens = len(unzipped_tokens)
-
-        w_gateup_t = get_quant_weight(w_gateup, transpose=True)
-        w_down_t = get_quant_weight(w_down, transpose=True)
 
         o1 = paddle.empty([num_unzipped_tokens, 2 * I], dtype="bfloat16")
         o2_fp8 = paddle.empty([num_unzipped_tokens, I], dtype="float8_e4m3fn")
@@ -447,12 +474,12 @@ class TeraMoENode:
 
         funcs = [
             lambda task_idx: deep_gemm.fp8_chunk_gemm_nt(
-                unzipped_x, w_gateup_t, o1, task_queue, task_idx),
+                unzipped_x, w_gateup_t, o1, task_queue, task_idx, w_gateup_replica),
             lambda task_idx: deep_gemm.chunk_weighted_swiglu(
                 o1, unzipped_probs, o2_fp8, task_queue, task_idx, self.chunk_size,
                 **self.activation, o2_scales=o2_scale),
             lambda task_idx: deep_gemm.fp8_chunk_gemm_nt(
-                (o2_fp8, o2_scale), w_down_t, o3, task_queue, task_idx),
+                (o2_fp8, o2_scale), w_down_t, o3, task_queue, task_idx, w_down_replica),
             lambda task_idx: deep_gemm.chunk_zip(
                 o3, zipped_out, atomic_to_zip, zip_to_atomic, recv_token_indices, num_valid_topk,
                 token_done, zip_done, task_queue, task_idx, self.chunk_size),
@@ -473,7 +500,7 @@ class TeraMoENode:
 
         with cached_notify_guard() as event:
             out, _, event = self.buffer.combine(
-                zipped_out, handle, async_finish=True, previous_event=event,
+                zipped_out, self.handle, async_finish=True, previous_event=event,
                 allocate_on_comm_stream=False, zip_done=zip_done)
 
             deep_gemm.set_num_sms(self.num_calc_sms)
@@ -489,7 +516,7 @@ class TeraMoENode:
         # 各专家 token 数重新向 512 对齐
         ks_cpu, m_start, m_start_wgrad = [], [0], [0]
         wgrad_align = QUANT_BLOCK_SIZE if self.fp8_wgrad else FP8_ALIGN
-        for n in tokens_per_expert:
+        for n in self.tokens_per_expert:
             ks_cpu.append((n + wgrad_align - 1) // wgrad_align * wgrad_align)
             m_start.append(m_start[-1] + (n + FP8_ALIGN - 1) // FP8_ALIGN * FP8_ALIGN)
             m_start_wgrad.append(m_start_wgrad[-1] + ks_cpu[-1])
@@ -497,7 +524,7 @@ class TeraMoENode:
         self.m_start_wgrad = m_start_wgrad
 
         async_load = AsyncLoad()
-        t = async_load(ks_cpu + m_start + m_start_wgrad + tokens_per_expert, dtype="int32")
+        t = async_load(ks_cpu + m_start + m_start_wgrad + self.tokens_per_expert, dtype="int32")
         self.grouped_layout = t[:len(ks_cpu)]
         self.m_start_gpu = t[len(ks_cpu) : len(ks_cpu) + len(m_start)]
         self.m_start_wgrad_gpu = t[len(ks_cpu) + len(m_start) : len(ks_cpu) + len(m_start) * 2]
@@ -519,37 +546,14 @@ class TeraMoENode:
         """Simple fallback for intranode."""
         ########################### DISPATCH FORWARD ###########################
 
+        self._prepare_dispatch()
+
         hidden_states = quant_input(self.hidden_states) if self.fp8 else self.hidden_states
         del self.hidden_states
 
-        (
-            num_tokens_per_rank,
-            num_tokens_per_rdma_rank,
-            num_tokens_per_expert,
-            is_token_in_rank,
-            previous_event,
-        ) = self.buffer.get_dispatch_layout(
-            self.token_indices,
-            self.num_dispatch_experts,
-            async_finish=False,
-            allocate_on_comm_stream=False,
-        )
+        recv_x, recv_token_indices, recv_token_probs, event = self._dispatch(hidden_states)
 
-        self._reduce_max_tokens_per_card(num_tokens_per_expert)
-
-        (
-            recv_x, recv_token_indices, recv_token_probs, tokens_per_expert, handle, event
-        ) = self.buffer.dispatch(
-            hidden_states,
-            topk_idx=self.token_indices,
-            topk_weights=self.token_probs,
-            num_tokens_per_rank=num_tokens_per_rank,
-            num_tokens_per_rdma_rank=num_tokens_per_rdma_rank,
-            num_tokens_per_expert=num_tokens_per_expert,
-            is_token_in_rank=is_token_in_rank,
-            async_finish=True,
-            allocate_on_comm_stream=False,
-        )
+        ########## METADATA ###########
 
         w_gateup, w_down = self.w_gateup, self.w_down
         E, I, H = w_down.shape
@@ -558,22 +562,22 @@ class TeraMoENode:
             w_down_t = get_quant_weight(w_down, transpose=True)
 
         ks_cpu = []
-        for i, n in enumerate(tokens_per_expert):
+        for i, n in enumerate(self.tokens_per_expert):
             ks_cpu.append((n + FP8_ALIGN - 1) // FP8_ALIGN * FP8_ALIGN)
         async_load = AsyncLoad()
         self.ks_cpu = ks_cpu
-        t = async_load(ks_cpu + tokens_per_expert, dtype="int32")
+        t = async_load(ks_cpu + self.tokens_per_expert, dtype="int32")
         self.grouped_layout = t[:len(ks_cpu)]
         self.tokens_per_expert_gpu = t[len(ks_cpu):]
-        self.m_indices = paddle.repeat_interleave(
-            paddle.arange(len(tokens_per_expert), dtype="int32"), self.grouped_layout)
+        self.m_indices = deep_gemm.gen_m_indices(
+            self.tokens_per_expert_gpu, sum(ks_cpu), FP8_ALIGN)
 
         M = sum(self.ks_cpu[:E])
         REPLICA = self.num_replicas > 0
         if REPLICA:
             self.m_indices, self.m_indices_replica = self.m_indices[:M], self.m_indices[M:] - E
 
-        task_queue_np = make_batch_task_queue(tokens_per_expert)
+        task_queue_np = make_batch_task_queue(self.tokens_per_expert)
         async_load.wait()
 
         event.current_stream_wait()
@@ -584,8 +588,6 @@ class TeraMoENode:
         self.recv_x = recv_x
         recv_token_indices = recv_token_indices.cast("int32")
         self.recv_token_indices = recv_token_indices
-        self.tokens_per_expert = tokens_per_expert
-        self.handle = handle
 
         ############################# GEMM FORWARD #############################
 
@@ -602,7 +604,7 @@ class TeraMoENode:
             x, rowmap, unzipped_probs, x_scale = paddle.nn.functional.moe_permute(
                 recv_x, recv_scale, recv_token_indices, recv_token_probs,
                 padding_alignment=FP8_ALIGN, num_experts=self.num_permute_experts,
-                tokens_per_expert=tokens_per_expert, using_ue8m0_scale=True)
+                tokens_per_expert=self.tokens_per_expert, using_ue8m0_scale=True)
 
         event.current_stream_wait() if REPLICA else ()
         num_unzipped_tokens = len(x)
@@ -660,7 +662,7 @@ class TeraMoENode:
 
         with cached_notify_guard() as event:
             out, _, event = self.buffer.combine(
-                zipped_out, handle, async_finish=True, previous_event=event,
+                zipped_out, self.handle, async_finish=True, previous_event=event,
                 allocate_on_comm_stream=False)
 
         self.unzipped_probs = unzipped_probs
@@ -704,18 +706,9 @@ class TeraMoENode:
         # 本来 dispatch 反向应该用 cache_mode, 但目前 cache_mode 无法计算 atomic_to_zip/zip_to_atomic,
         # 因此只能像前向一样再跑一遍, 会浪费一定的通信带宽
         (
-            _, recv_token_indices, recv_token_probs, tokens_per_expert, handle, event,
-            do3, _, atomic_to_zip_bwd, zip_to_atomic_bwd, num_valid_topk, task_queue,
-        ) = self.buffer.dispatch(
-            dout,
-            topk_idx=self.token_indices,
-            topk_weights=self.token_probs,  # 无用, 只是非 cache_mode 必须传入
-            **self.dispatch_layout,
-            async_finish=True,
-            allocate_on_comm_stream=False,
-            unzip_alignment=FP8_ALIGN,
-            unzip_chunk_size=self.chunk_size,
-        )
+            _, recv_token_indices, recv_token_probs, event, do3, _, atomic_to_zip_bwd,
+            zip_to_atomic_bwd, num_valid_topk, task_queue
+        ) = self._dispatch(dout, chunk=True)
 
         del self.token_indices, self.token_probs, self.dispatch_layout
 
@@ -760,7 +753,7 @@ class TeraMoENode:
         ############################ DISPATCH BACKWARD #############################
 
         dhidden_states, dtoken_probs, event = self.buffer.combine(
-            drecv_x, handle, drecv_probs, async_finish=True, allocate_on_comm_stream=False,
+            drecv_x, self.handle, drecv_probs, async_finish=True, allocate_on_comm_stream=False,
             zip_done=zip_done)
 
         deep_gemm.set_num_sms(self.num_calc_sms)
@@ -793,18 +786,9 @@ class TeraMoENode:
         dout_quant = quant_input(dout)
 
         (
-            _, recv_token_indices, recv_token_probs, _, handle, event,
-            do3, _, atomic_to_zip_bwd, zip_to_atomic_bwd, num_valid_topk, task_queue,
-        ) = self.buffer.dispatch(
-            dout_quant,
-            topk_idx=self.token_indices,
-            topk_weights=self.token_probs,  # 无用
-            **self.dispatch_layout,
-            async_finish=True,
-            allocate_on_comm_stream=False,
-            unzip_alignment=FP8_ALIGN,
-            unzip_chunk_size=self.chunk_size,
-        )
+            _, recv_token_indices, recv_token_probs, event, do3, _, atomic_to_zip_bwd,
+            zip_to_atomic_bwd, num_valid_topk, task_queue
+        ) = self._dispatch(dout_quant, chunk=True)
 
         del self.token_indices, self.token_probs, self.dispatch_layout
 
@@ -864,7 +848,7 @@ class TeraMoENode:
         ########################## DISPATCH BACKWARD ###########################
 
         dhidden_states, dtoken_probs, event = self.buffer.combine(
-            drecv_x, handle, drecv_probs, async_finish=True, allocate_on_comm_stream=False)
+            drecv_x, self.handle, drecv_probs, async_finish=True, allocate_on_comm_stream=False)
 
         deep_gemm.set_num_sms(self.num_calc_sms)
         # NOTES: 反向不使用 combine overlap, 因为已经有计算量较大的 wgrad, 足以填满甚至超出 combine
@@ -902,10 +886,8 @@ class TeraMoENode:
         self.recv_dout = recv_dout
         self.dispatch_done_event = event
 
-        self.m_indices = paddle.concat([
-            paddle.full([self.ks_cpu[i]], i, dtype="int32")
-            for i, n in enumerate(self.tokens_per_expert)
-        ])
+        self.m_indices = deep_gemm.gen_m_indices(
+            self.tokens_per_expert_gpu, self.m_start_wgrad[-1], FP8_ALIGN)
 
         self.x = deep_gemm.token_gather(
             self.unzipped_x[0], self.ordered_to_atomic, self.unzipped_x[1])
@@ -915,14 +897,23 @@ class TeraMoENode:
 
     def _backward_fp8_bf16_wgrad_wait(self):
         w_gateup, w_down = self.w_gateup, self.w_down
-        H, I = w_gateup.shape[1], w_down.shape[1]
+        E, I, H = w_down.shape
         w_gateup_n = get_quant_weight(w_gateup)
         w_down_n = get_quant_weight(w_down)
+
+        REPLICA = self.num_replicas > 0
+        M = sum(self.ks_cpu[:E])
+        if REPLICA:
+            w_gateup_replica_grad, w_down_replica_grad = self._get_replica_grads()
 
         self.dispatch_done_event.current_stream_wait()
         del self.dispatch_done_event
 
         ############################ GEMM BACKWARD #############################
+
+        if REPLICA:
+            (w_gateup_replica, w_down_replica), event = self._weight_sync((w_gateup_n, w_down_n))
+            self.m_indices, self.m_indices_replica = self.m_indices[:M], self.m_indices[M:] - E
 
         deep_gemm.set_num_sms(0)
 
@@ -930,6 +921,8 @@ class TeraMoENode:
             self.recv_dout, self.rowmap, self.tokens_per_expert_gpu, len(self.o1), FP8_ALIGN,
             quant=True)
         del self.recv_dout
+
+        event.current_stream_wait() if REPLICA else ()
 
         ########## DOWN_GRAD ###########
 
@@ -939,7 +932,10 @@ class TeraMoENode:
 
         do2 = paddle.empty([num_unzipped_tokens, I], dtype="bfloat16")
         deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
-            (do3_fp8, do3_scale.T), w_down_n, do2, self.m_indices)
+            (do3_fp8[:M], do3_scale[:, :M].contiguous().T), w_down_n, do2[:M], self.m_indices)
+        deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
+            (do3_fp8[M:], do3_scale[:, M:].contiguous().T), w_down_replica, do2[M:],
+            self.m_indices_replica) if REPLICA else ()
         del do3_fp8, do3_scale
 
         ######### SWIGLU_GRAD ##########
@@ -948,19 +944,24 @@ class TeraMoENode:
             self.o1, self.unzipped_probs, do2, **self.activation, inplace=True, quant=True)
         del self.o1, do2, self.unzipped_probs
 
-        bf16_weight_grad(self.x, do1, w_gateup, self.ks_cpu, self.grouped_layout)
-        del self.x, do1
+        if not REPLICA:
+            bf16_weight_grad(self.x, do1, w_gateup, self.ks_cpu, self.grouped_layout)
+            bf16_weight_grad(o2, do3, w_down, self.ks_cpu, self.grouped_layout)
+            del self.x, do1, o2, do3
 
         ######### GATEUP_GRAD ##########
 
         dx = paddle.empty([num_unzipped_tokens, H], dtype="bfloat16")
         deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
-            (do1_fp8, do1_scale.T), w_gateup_n, dx, self.m_indices)
+            (do1_fp8[:M], do1_scale[:, :M].contiguous().T), w_gateup_n, dx[:M], self.m_indices)
+        deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
+            (do1_fp8[M:], do1_scale[:, M:].contiguous().T), w_gateup_replica, dx[M:],
+            self.m_indices_replica) if REPLICA else ()
         del do1_fp8, do1_scale
 
         drecv_x, drecv_probs = paddle.nn.functional.moe_unpermute(
             dx, self.rowmap, recv_indices, dprobs, total_zipped_tokens=num_zipped_tokens,
-            num_experts=len(w_gateup))
+            num_experts=self.num_permute_experts)
         del dx, self.rowmap, dprobs
 
         ########################## DISPATCH BACKWARD ###########################
@@ -973,12 +974,21 @@ class TeraMoENode:
 
         ################################ WGRAD #################################
 
-        paddle.base.core.nvprof_nvtx_push("wgrad")
-        deep_gemm.set_num_sms(self.num_calc_sms)
+        # Use wgrad overlap only when UltraEP balancing is enabled. This is because wgrad is
+        # usually too slow to overlap and increases much peak memory in unbalanced cases
+        if REPLICA:
+            paddle.base.core.nvprof_nvtx_push("wgrad")
+            deep_gemm.set_num_sms(self.num_calc_sms)
+            bf16_weight_grad(self.x[:M], do1[:M], w_gateup, self.ks_cpu[:E],
+                             self.grouped_layout[:E])
+            bf16_weight_grad(self.x[M:], do1[M:], w_gateup_replica_grad, self.ks_cpu[E:],
+                             self.grouped_layout[E:]) if REPLICA else ()
+            bf16_weight_grad(o2[:M], do3[:M], w_down, self.ks_cpu[:E], self.grouped_layout[:E])
+            bf16_weight_grad(o2[M:], do3[M:], w_down_replica_grad, self.ks_cpu[E:],
+                             self.grouped_layout[E:]) if REPLICA else ()
+            paddle.base.core.nvprof_nvtx_pop()
 
-        bf16_weight_grad(o2, do3, w_down, self.ks_cpu, self.grouped_layout)
-
-        paddle.base.core.nvprof_nvtx_pop()
+            self.combine_done_event = self._grad_reduce(self.buffer.num_sms)
 
     def _backward_serial(self, dout: Tensor):
         ########################### COMBINE BACKWARD ###########################
@@ -1033,6 +1043,7 @@ class TeraMoENode:
             deep_gemm.m_grouped_fp8_gemm_nt_contiguous(
                 (do3_fp8[M:], do3_scale[:, M:].contiguous().T), w_down_replica, do2[M:],
                 self.m_indices_replica) if REPLICA else ()
+            del do3_fp8, do3_scale
 
             do1, dprobs, o2, do1_fp8, do1_scale = deep_gemm.weighted_swiglu_grad(
                 self.o1, self.unzipped_probs, do2, **self.activation, inplace=True, quant=True)
