@@ -4,8 +4,10 @@ import paddle.distributed as dist
 from paddle.base.core import task
 from paddle.distributed.communication.group import Group
 
+from . import ultra_ep
 from .triton_ops import topk_to_dense, dense_to_topk
 
+NVL_DOMAIN_SIZE = 8
 TRITON_FUSION = True
 
 
@@ -83,9 +85,6 @@ def update_placement(
     group: Group, topk_probs: Tensor, topk_ids: Tensor, num_experts: int, num_replicas: int
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     """Update expert placement for a single layer based on real-time load statistics."""
-    import ultra_ep
-
-    NVL_DOMAIN_SIZE = 8
     EP = group.world_size
     seq_len, top_k = topk_ids.shape
 

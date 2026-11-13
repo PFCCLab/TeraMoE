@@ -1,18 +1,20 @@
 """Build helpers for the `teramoe` meta-package.
 
-The two innovation forks live in `third_party/{DeepEP,DeepGEMM}` and are kept as
-independent, separately installable repos.  This module builds each of them with
-its own `setup.py` into a scratch directory and then re-lays the resulting
+The innovation forks live in `third_party/{DeepEP,DeepGEMM,UltraEP}` and are kept
+as independent, separately installable repos.  This module builds each of them
+with its own `setup.py` into a scratch directory and then re-lays the resulting
 artifacts out under the `teramoe` namespace, so that a single wheel provides:
 
     teramoe/deep_ep            (from third_party/DeepEP)
     teramoe/deep_gemm          (from third_party/DeepGEMM)
+    teramoe/ultra_ep           (from third_party/UltraEP)
     teramoe_deep_ep_cpp.so     C++ extension, uniquely named
     teramoe_deep_gemm_cpp/     C++ extension, uniquely named
 
 The unique extension module names are what let `teramoe.deep_gemm` coexist with
 `paddlefleet_ops.deep_gemm` in one process: each Python package binds its own
-`.so`, so neither clobbers the other's JIT include path.
+`.so`, so neither clobbers the other's JIT include path. UltraEP's extension is
+already a submodule (`ultra_ep._C`) imported relatively, so it needs no rename.
 """
 
 from __future__ import annotations
@@ -134,6 +136,13 @@ def get_libs() -> list[Lib]:
                 # at a `_pd_.so` that is never produced); the extension module
                 # itself takes import priority, so only ship the `.so`.
                 "teramoe_deep_ep_cpp.so": "teramoe_deep_ep_cpp.so",
+            },
+        ),
+        Lib(
+            name="UltraEP",
+            source_rel_path="third_party/UltraEP",
+            artifacts={
+                "ultra_ep": "teramoe/ultra_ep",
             },
         ),
     ]
