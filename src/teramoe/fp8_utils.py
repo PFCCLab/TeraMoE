@@ -475,14 +475,19 @@ class TeraMoENode:
         funcs = [
             lambda task_idx: deep_gemm.fp8_chunk_gemm_nt(
                 unzipped_x, w_gateup_t, o1, task_queue, task_idx, w_gateup_replica),
-            lambda task_idx: deep_gemm.chunk_weighted_swiglu(
-                o1, unzipped_probs, o2_fp8, task_queue, task_idx, self.chunk_size,
-                **self.activation, o2_scales=o2_scale),
+            lambda task_idx, end=None: deep_gemm.chunk_weighted_swiglu(
+                o1, unzipped_probs, o2_fp8,
+                task_queue if end is None else task_queue[task_idx:end],
+                task_idx if end is None else -1,
+                self.chunk_size, **self.activation, o2_scales=o2_scale),
             lambda task_idx: deep_gemm.fp8_chunk_gemm_nt(
                 (o2_fp8, o2_scale), w_down_t, o3, task_queue, task_idx, w_down_replica),
-            lambda task_idx: deep_gemm.chunk_zip(
+            lambda task_idx, end=None: deep_gemm.chunk_zip(
                 o3, zipped_out, atomic_to_zip, zip_to_atomic, recv_token_indices, num_valid_topk,
-                token_done, zip_done, task_queue, task_idx, self.chunk_size),
+                token_done, zip_done,
+                task_queue if end is None else task_queue[task_idx:end],
+                task_idx if end is None else -1,
+                self.chunk_size),
         ]
 
         task_launcher = GroupedTaskLauncher(

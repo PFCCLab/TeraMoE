@@ -3,7 +3,7 @@ from typing import Callable
 
 import paddle
 
-from . import deep_ep
+from . import deep_ep, deep_gemm
 
 FP8_ALIGN = 128
 
@@ -37,6 +37,7 @@ class GroupedTaskLauncher:
         """Stage A: compute overlaps with dispatch util dispatch finishes."""
         assert self._dispatch_done_event is not None, (
             "dispatch_overlap requires dispatch_done_event be given")
+        deep_gemm.set_pdl(True)
 
         for task_idx in range(self._num_tasks):
             paddle.base.core.nvprof_nvtx_push(f"A{task_idx}")
@@ -54,6 +55,7 @@ class GroupedTaskLauncher:
             if self._dispatch_done_event.query():
                 break
 
+        deep_gemm.set_pdl(False)
         return self._next_task_idx
 
     def _grouped_launch(self, begin, end):
@@ -69,8 +71,16 @@ class GroupedTaskLauncher:
         i = 0
 
         for n, func in enumerate(self._funcs):
-            # 每组 func 开始前让副 stream 等待一次主 stream, 保持组的边界;
-            # 其实从正确性上没有必要, 只是让 timeline 更整齐, 对性能影响未知
+            # 对于支持 batched launch 的 func 仅调用一次, 调用前需等待副 stream
+            if func.__code__.co_argcount == 2:
+                _task_done_event.record(_grouped_launch_stream)
+                self._calc_stream.wait_event(_task_done_event)
+                paddle.base.core.nvprof_nvtx_push(f"G{n}")
+                func(begin, end)
+                paddle.base.core.nvprof_nvtx_pop()
+                continue
+
+            # 每组 func 开始前让副 stream 等待一次主 stream, 保持组的边界
             _task_done_event.record()
             _grouped_launch_stream.wait_event(_task_done_event)
 
@@ -108,12 +118,14 @@ class GroupedTaskLauncher:
 
     def run_combine_overlap(self):
         """Stage C: compute overlaps with combine."""
+        deep_gemm.set_pdl(True)
         for task_idx in range(self._next_task_idx, self._num_tasks):
             paddle.base.core.nvprof_nvtx_push(f"C{task_idx}")
             for func in self._funcs:
                 func(task_idx)
             paddle.base.core.nvprof_nvtx_pop()
             self._next_task_idx = task_idx + 1
+        deep_gemm.set_pdl(False)
 
     def __del__(self):
         assert self._next_task_idx == self._num_tasks, (
