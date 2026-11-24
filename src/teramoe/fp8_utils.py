@@ -1030,12 +1030,20 @@ class TeraMoENode:
         if REPLICA:
             (w_gateup_replica, w_down_replica), event = self._weight_sync(
                 (w_gateup_n, w_down_n) if self.fp8 else (w_gateup, w_down))
-            prioritize_comm_stream()
 
-        do3, do3_fp8, do3_scale = deep_gemm.token_scatter(
-            recv_dout, rowmap, self.tokens_per_expert_gpu, len(self.o1), FP8_ALIGN,
-            quant=self.fp8 is not None)
-        assert self.fp8 or (do3_fp8 is None and do3_scale is None)
+        if H % QUANT_BLOCK_SIZE == 0:
+            prioritize_comm_stream() if REPLICA else ()
+            do3, do3_fp8, do3_scale = deep_gemm.token_scatter(
+                recv_dout, rowmap, self.tokens_per_expert_gpu, len(self.o1), FP8_ALIGN,
+                quant=self.fp8 is not None)
+            assert self.fp8 or (do3_fp8 is None and do3_scale is None)
+        else:
+            assert not self.fp8
+            do3, _, _, _ = paddle.nn.functional.moe_permute(
+                recv_dout, None, self.recv_token_indices,
+                paddle.empty_like(self.recv_token_indices, dtype="float32"),  # placeholder
+                padding_alignment=FP8_ALIGN, num_experts=self.num_permute_experts,
+                tokens_per_expert=self.tokens_per_expert)
         del recv_dout
 
         event.current_stream_wait() if REPLICA else ()
