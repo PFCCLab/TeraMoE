@@ -103,6 +103,7 @@ def forward_autograd(
     num_calc_sms: int | None = None,
     combine_overlap_ratio: float = 0.3,
     num_replicas: int = 2,
+    bwd_hook: Callable[[str, str], None] | None = None,
 ) -> Tensor:
     """
     Autograd wrapper for TeraMoE.
@@ -124,6 +125,8 @@ def forward_autograd(
         num_calc_sms (int, optional): Number of SMs for compute. If not given, infers from the deep_ep config. Default is None.
         combine_overlap_ratio (float, optional): Ratio of tasks to overlap with combine.
         num_replicas (int, optional): Number of replica experts per rank for UltraEP, 0 to disable UltraEP. Default is 2.
+        bwd_hook (Callable[[str, str], None], optional): Backward callback bwd_hook(kind, phase), see
+            TeraMoENode.bwd_hook. Default is None (no callback).
 
     Returns:
         out (Tensor): The hidden_states after feed-forward network.
@@ -191,6 +194,7 @@ def forward_autograd(
         buffer, hs_2d, topk_weights, topk_indices, w_gateup, w_down, group, num_experts,
         fp8, fp8_wgrad, chunk_size, num_calc_sms, num_replicas, combine_overlap_ratio, activation,
         barrier_async)
+    node.bwd_hook = bwd_hook
 
     fn_args, fn_out = (), ()
     if combine_overlap_handle is not None:

@@ -158,6 +158,12 @@ class TeraMoENode:
         self.combine_overlap_ratio = combine_overlap_ratio
         self.activation = activation
         self.barrier_async = barrier_async
+        # Optional backward callback bwd_hook(kind, phase), set by forward_autograd.
+        # None (default) = no call at all. Only wired into _backward_fp8_bf16_wgrad(+_wait) and backward_wait:
+        #   ("dispatch","pre") / ("dispatch","done") / ("combine","pre") / ("combine","post") around the backward
+        #   DeepEP calls, ("experts","ready") in backward_wait once the compute stream has waited for the expert
+        #   wgrad + replica grad_reduce. Other backward paths raise NotImplementedError when it is set.
+        self.bwd_hook = None
 
         self.enable_overlap = chunk_size > 0 and self.buffer.runtime.get_num_rdma_ranks() > 1
         self.avg_tokens_per_card = token_indices.size  # seqlen * topk
@@ -692,6 +698,12 @@ class TeraMoENode:
 
         This function accepts one input, and has no output in the same way as forward.
         """
+        if self.bwd_hook is not None and not (
+                self.enable_overlap and self.fp8 and not self.fp8_wgrad):
+            raise NotImplementedError(
+                "TeraMoE bwd_hook is only wired into _backward_fp8_bf16_wgrad (enable_overlap, fp8, "
+                f"not fp8_wgrad); got enable_overlap={self.enable_overlap} fp8={self.fp8} "
+                f"fp8_wgrad={self.fp8_wgrad}.")
         paddle.base.core.nvprof_nvtx_push("teramoe_backward")
         if self.enable_overlap:
             if self.fp8:
@@ -883,6 +895,8 @@ class TeraMoENode:
         ########################### COMBINE BACKWARD ###########################
 
         # 非 chunk 模式, 可以使用 cache mode, 发送 BF16
+        if self.bwd_hook is not None:
+            self.bwd_hook("dispatch", "pre")
         with cached_notify_guard() as event:
             recv_dout, _, _, _, _, event = self.buffer.dispatch(
                 dout, handle=self.handle, async_finish=True, previous_event=event,
@@ -913,6 +927,8 @@ class TeraMoENode:
 
         self.dispatch_done_event.current_stream_wait()
         del self.dispatch_done_event
+        if self.bwd_hook is not None:
+            self.bwd_hook("dispatch", "done")
 
         ############################ GEMM BACKWARD #############################
 
@@ -971,11 +987,15 @@ class TeraMoENode:
 
         ########################## DISPATCH BACKWARD ###########################
 
+        if self.bwd_hook is not None:
+            self.bwd_hook("combine", "pre")
         dhidden_states, dtoken_probs, event = self.buffer.combine(
             drecv_x, self.handle, drecv_probs, async_finish=True, allocate_on_comm_stream=False)
 
         self.input_grads = (dhidden_states, dtoken_probs)
         self.combine_done_event = event
+        if self.bwd_hook is not None:
+            self.bwd_hook("combine", "post")
 
         ################################ WGRAD #################################
 
@@ -1140,6 +1160,11 @@ class TeraMoENode:
         input_grads = self.input_grads
         self.combine_done_event.current_stream_wait()
         del self.input_grads, self.combine_done_event
+        # The current stream has now waited for combine_done_event, which with replicas is the
+        # grad_reduce event (_backward_fp8_bf16_wgrad_wait sets it last), so the master wgrad (current stream) and the
+        # replica grads summed into main_grad (comm stream) are ordered before anything recorded on it from here.
+        if self.bwd_hook is not None:
+            self.bwd_hook("experts", "ready")
         return input_grads
 
 
